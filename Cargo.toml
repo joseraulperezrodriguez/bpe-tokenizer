@@ -1,0 +1,11 @@
+[package]
+name = "bpe-tokenizer"
+version = "0.1.0"
+edition = "2021"
+description = "A byte-pair encoding tokenizer implemented in Rust"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+fmt = "0.1.0"
+regex = "1"

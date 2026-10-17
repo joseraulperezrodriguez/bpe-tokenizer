@@ -1,0 +1,48 @@
+ The BPE Algorithm:
+  - We do a pre-tokenization process in which we split the text by symbols and characters to avoid merging tokens beyond punctuation or other symbols.
+     - The result of this process is a list of "words" and its ocurrence count. From this point on, an ocurrence of a token, means that it appeared in a word, which we know the actual ocurrence in the corpus so we use that factor to get the global ocurrence count.
+  - Initially all tokens are single characters (the 256 bytes), so our vocabulary only contains these 256 characters.
+  - We keep 2 lists of tokens, the ones that are part of the final vocabulary and the total running tokens, the ones that compounds the corpus and that we continue merging. 
+  - For each "running token" for each word where it appears, we form 2 new tokens: merging it to its left and right token.
+     - We keep a count of ocurrences of these new tokens and its positions (each ocurrence needs to have information to reconstruct how this token was created, which basically means wich parts of the word were merged to compound the new token)
+  - The token with the most number of ocurrences is added to the vocabulary.
+    - We remove the occurrences of the parts that formed the new token, if that token reached number of ocurrences 0, we remove it from the "live tokens".
+	- We also remove the ocurrences from prev and next, for example if in tokens 'a' 'b' 'c' 'd', we merged 'bc', besides updating 'b' and 'c' ocurrences map, we also need to update 'ab' and 'cd' maps.
+  - We repeat this process until the vocabulary contains the desired number of tokens.
+ 
+ Desired Vocabulary size: 100K tokens,
+ 
+ Training Corpus:
+  - 45 GB of the English Wikipedia articles, stored in (almost) plain text.
+  - Stored locally in my machine.
+ 
+ 
+ Structures:
+  - {token(left, right), [positions]} -> a map where we store where each token appears in the word where it was merged. 
+     - Here left and right are literally the parts that compound this token, strings.
+	 - Each position encodes: {word: [l1, r1, l2, r2]}, where l1, r1 are the left substring indexes, and l1, r2 are the righ substring indexes. 
+  - in memory max heap (keyed as (token left, right)) with the running tokens by ocurrences, store only the tokens, and its ocurrence count, so storage is O(running tokens)
+  - {word, [tokens]} -> a map where we store which running tokens form the current word.
+
+ 
+ Process:
+  0- Add the 256 bytes as tokens in the initial vocabulary.
+  1- (Executed once) for each word, iterate over its tokens, for each token:
+    - create two new pairs (forming the new tokens), the result of merging current token with its previous and next token.
+	- update the max heap with this count, using lazy count or a custom heap implementation that does this in place, heapifying the new element.
+	- update the tokens map, adding the new pair and where it was formed from.
+
+  2- Add the top of the heap to the vocabulary list.
+    - For each ocurrence of the winning token:
+	  - here we need to update the word and tokens map, for that, we iterate over the positions where the winning token is present and do the following:
+	    - The positions within the some word are sorted by ocurrence, we can handle the below algorithm accordingly.
+        - update the tokens count map for its left and right parts, as well as for the tokens that has left and right as suffix or prefix, removing them from the ocurrences list and possibly from the running tokens if ocurrences reach zero.
+           - for example if in tokens 'a' 'b' 'c' 'd', we merged 'bc', besides updating 'b' and 'c' ocurrences map, we also need to update 'ab' and 'cd' maps.
+		   - this update means going to the positions that are part of the winning token, find the tokens that involve them (constructive algorithm) and remove this occurence from their possitions list.
+	    - update the word map, by merging the winning tokens in that word token list.
+	  - We need special attention to overlapping merges. If 2 winning tokens overlap, for example in "aaa", there is "aa" and "aa" adjacent tokens to merge, the merge process avoid overlapping by jumping by 2 elements after it merges 2 tokens.
+  3- Repeat steps 2 until we get the desired number of tokens.
+  
+ Other things to consider:
+   - Tie break rule: ties are broken lexicographically (lowest pair first).
+   - The count of a pair equals the total length of its positions lists (weighted by word occurrence counts) — no separate claim computation.
