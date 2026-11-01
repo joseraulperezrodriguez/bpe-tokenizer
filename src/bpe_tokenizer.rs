@@ -56,6 +56,9 @@ impl BPETokenizer {
 
         // Iterating over all words
         for (word, count) in &self.word_ocurrences {
+           if *count == 0 {
+               continue;
+           }
            // List of tokens that initially form this word, one byte each.
            let mut word_tokens: Vec<TokenInfo> = Vec::new();
            for (index, byte) in word.bytes().enumerate() {
@@ -790,6 +793,18 @@ mod tests {
     }
 
     #[test]
+    fn setup_ignores_zero_frequency_words() {
+        let mut tokenizer = BPETokenizer::new(HashMap::from([("ab".to_string(), 0)]));
+
+        tokenizer.setup();
+        tokenizer.quickoff().unwrap();
+
+        assert!(tokenizer.word_tokens.is_empty());
+        assert!(tokenizer.tokens.is_empty());
+        assert!(tokenizer.max_heap.is_empty());
+    }
+
+    #[test]
     fn learned_token_ids_start_after_the_256_byte_tokens() {
         let mut word_ocurrences = HashMap::new();
         word_ocurrences.insert("ab".to_string(), 1);
@@ -1005,6 +1020,39 @@ mod tests {
     }
 
     #[test]
+    fn find_and_insert_adyacent_tokens_uses_byte_offsets_for_multibyte_tokens() {
+        let mut map = HashMap::new();
+        let winning = TokenInfo::new(b"b".to_vec(), Some(b"cc".to_vec()));
+        let word_tokens = vec![
+            TokenInfo::new(b"aa".to_vec(), None),
+            TokenInfo::new(b"b".to_vec(), None),
+            TokenInfo::new(b"cc".to_vec(), None),
+            TokenInfo::new(b"d".to_vec(), None),
+        ];
+        let positions = vec![(OcurrencePosition::new(2, 1), Some(OcurrencePosition::new(3, 2)))];
+
+        BPETokenizer::find_and_insert_adyacent_tokens(
+            &mut map,
+            &winning,
+            &"aabccd".to_string(),
+            &word_tokens,
+            &positions,
+        )
+        .unwrap();
+
+        let left_adjacent = TokenInfo::new(b"aa".to_vec(), Some(b"b".to_vec()));
+        let right_adjacent = TokenInfo::new(b"cc".to_vec(), Some(b"d".to_vec()));
+        assert_eq!(
+            map[&left_adjacent]["aabccd"],
+            vec![(OcurrencePosition::new(0, 2), Some(OcurrencePosition::new(2, 1)))]
+        );
+        assert_eq!(
+            map[&right_adjacent]["aabccd"],
+            vec![(OcurrencePosition::new(3, 2), Some(OcurrencePosition::new(5, 1)))]
+        );
+    }
+
+    #[test]
     fn find_and_insert_adyacent_tokens_handles_winner_at_word_start() {
         let mut map = HashMap::new();
         let winning = TokenInfo::new(b"a".to_vec(), Some(b"b".to_vec()));
@@ -1142,6 +1190,35 @@ mod tests {
     }
 
     #[test]
+    fn get_tokens_to_update_accumulates_repeated_adjacent_candidates() {
+        let mut tokenizer = BPETokenizer::new(HashMap::from([("xabyxaby".to_string(), 1)]));
+        tokenizer.setup();
+        tokenizer.quickoff().unwrap();
+
+        let winning = TokenInfo::new(b"a".to_vec(), Some(b"b".to_vec()));
+        let updates = tokenizer.get_tokens_to_update(&winning).unwrap();
+        let left_adjacent = TokenInfo::new(b"x".to_vec(), Some(b"a".to_vec()));
+        let right_adjacent = TokenInfo::new(b"b".to_vec(), Some(b"y".to_vec()));
+
+        assert_eq!(updates[&left_adjacent]["xabyxaby"].len(), 2);
+        assert_eq!(updates[&right_adjacent]["xabyxaby"].len(), 2);
+        assert_eq!(
+            updates[&left_adjacent]["xabyxaby"],
+            vec![
+                (OcurrencePosition::new(0, 1), Some(OcurrencePosition::new(1, 1))),
+                (OcurrencePosition::new(4, 1), Some(OcurrencePosition::new(5, 1))),
+            ]
+        );
+        assert_eq!(
+            updates[&right_adjacent]["xabyxaby"],
+            vec![
+                (OcurrencePosition::new(2, 1), Some(OcurrencePosition::new(3, 1))),
+                (OcurrencePosition::new(6, 1), Some(OcurrencePosition::new(7, 1))),
+            ]
+        );
+    }
+
+    #[test]
     fn get_tokens_to_update_returns_empty_when_winner_has_no_neighbors() {
         let mut tokenizer = BPETokenizer::new(HashMap::from([("ab".to_string(), 1)]));
         tokenizer.setup();
@@ -1198,6 +1275,7 @@ mod tests {
         tokenizer.quickoff().unwrap();
         let adjacent = TokenInfo::new(b"a".to_vec(), Some(b"b".to_vec()));
         let original = tokenizer.tokens[&adjacent].get_ocurrences()["abab"].clone();
+        assert_eq!(tokenizer.tokens[&adjacent].get_ocurrences_count(), 4);
         let to_remove = HashMap::from([(
             adjacent.clone(),
             HashMap::from([("abab".to_string(), vec![original[0].clone()])]),
