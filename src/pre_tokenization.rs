@@ -17,7 +17,7 @@ const TOKEN_REGEX: &str =
 static TOKEN_PATTERN: OnceLock<Regex> = OnceLock::new();
 
 impl PreTokenization {
-    pub fn count_tokens(text: &str, out: &mut HashMap<String, u32>) {
+    pub fn count_tokens(text: &str, out: &mut HashMap<String, u64>) {
         TOKEN_PATTERN
             .get_or_init(|| Regex::new(TOKEN_REGEX).expect("token regex must be valid"))
             .find_iter(text)
