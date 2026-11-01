@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
-use crate::{OcurrencePosition, Token, TokenInfo, TokenOcurrences, TokenizationError};
+use crate::{OcurrencePosition, TokenInfo, TokenOcurrences, TokenizationError};
 
 use super::BPETokenizer;
 
@@ -16,7 +16,6 @@ impl BPETokenizer {
             let token_id = u32::from(byte);
             self.tokens_id.insert(token.clone(), token_id);
             self.id_tokens.insert(token_id, token.clone());
-            self.vocabulary.push(Token::new(token_id, token_id, None));
         }
 
         // Iterating over all words

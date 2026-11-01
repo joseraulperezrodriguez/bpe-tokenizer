@@ -58,24 +58,6 @@ impl Ord for TokenInfo {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct Token {
-    token_id: u32,
-    left_part: u32,
-    right_part: Option<u32>,
-}
-
-impl Token {
-
-    pub fn new(token_id: u32, left_part: u32, right_part: Option<u32>) -> Self {
-       Self{
-        token_id, 
-        left_part,
-        right_part,
-       }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

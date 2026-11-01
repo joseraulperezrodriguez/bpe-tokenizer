@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
-use crate::{OcurrencePosition, Token, TokenInfo, TokenizationError};
+use crate::{OcurrencePosition, TokenInfo, TokenizationError};
 
 use super::BPETokenizer;
 
@@ -237,7 +237,7 @@ impl BPETokenizer {
      * It also update the structures as follows:
      *  - Update all tokens that overlap with the winning token.
      *  - Create new tokens from the ones that are adyancent to the winning token after merge it.
-     *  - Register the winning token in the vocabulary.
+     *  - Register the winning token in the id maps and the merge table.
      */
     pub fn next_token(&mut self) -> Result<Option<(u32, TokenInfo)>, TokenizationError> {
         let winning_token = match self.get_winning_token() {
@@ -252,7 +252,7 @@ impl BPETokenizer {
         };
 
         // new token id for the winning token.
-        let token_id = self.vocabulary.len() as u32;
+        let token_id = self.id_tokens.len() as u32;
         // getting the left and right ids that compounds the new token.
         let (left_id, right_id) = match self.token_parts(&winning_token) {
             Ok((left_id, right_id)) => (left_id, right_id),
@@ -261,11 +261,10 @@ impl BPETokenizer {
             }
         };
 
-        // Adding the new token to the vocabulary and the token id maps.
-        self.vocabulary
-            .push(Token::new(token_id, left_id, Some(right_id)));
+        // Adding the new token to the token id maps and the learned merge table.
         self.tokens_id.insert(winning_token.to_bytes(), token_id);
         self.id_tokens.insert(token_id, winning_token.to_bytes());
+        self.pair_merges.insert((left_id, right_id), token_id);
 
         // It holds the positions that we need to remove from the ocurrences list in a given token for a a given word.
         // Key: The token candidate that we need to update

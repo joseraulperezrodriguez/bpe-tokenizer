@@ -61,3 +61,5 @@
 ### Implementation Design
 
 The trainer represents token contents as byte vectors. Pre-tokenized words remain UTF-8 strings as map keys, but each word is split with `str::bytes()` into one-byte initial tokens. The base vocabulary is initialized in byte-value order, and learned token IDs start at 256. Position offsets and token lengths use byte units. `TokenInfo::to_bytes()` returns the exact token bytes; its string conversion is lossy for invalid UTF-8 and should only be used for display.
+
+Encoding/decoding: each learned merge is stored in a `(left ID, right ID) -> merged ID` table. `encode` pre-tokenizes the text, then per word repeatedly merges the adjacent pair with the lowest learned ID (the earliest-learned merge wins, ties resolved left to right) until no learned pair remains. `decode` concatenates the bytes of each token ID; `decode_to_string` is lossy for non-UTF-8 boundaries.

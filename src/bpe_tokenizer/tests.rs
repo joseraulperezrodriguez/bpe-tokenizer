@@ -20,7 +20,7 @@ mod tests {
         assert_eq!(tokenizer.max_heap.len(), 0); // No new tokens yet
         assert_eq!(tokenizer.tokens_id.len(), 256);
         assert_eq!(tokenizer.id_tokens.len(), 256);
-        assert_eq!(tokenizer.vocabulary.len(), 256);
+        assert!(tokenizer.pair_merges.is_empty());
         for byte in u8::MIN..=u8::MAX {
             assert_eq!(tokenizer.tokens_id.get(&vec![byte]), Some(&u32::from(byte)));
         }
@@ -216,8 +216,8 @@ mod tests {
 
         tokenizer.setup();
 
-        assert_eq!(tokenizer.vocabulary.len(), 256);
         assert_eq!(tokenizer.tokens_id.len(), 256);
+        assert_eq!(tokenizer.id_tokens.len(), 256);
         assert!(tokenizer.tokens.is_empty());
         assert!(tokenizer.word_tokens.is_empty());
     }
@@ -1087,7 +1087,7 @@ mod tests {
             tokenizer.next_token(),
             Err(TokenizationError::MissingToken(_))
         ));
-        assert!(tokenizer.vocabulary.is_empty());
+        assert!(tokenizer.pair_merges.is_empty());
     }
 
     #[test]

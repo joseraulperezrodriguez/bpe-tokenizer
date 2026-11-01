@@ -17,6 +17,17 @@ const TOKEN_REGEX: &str =
 static TOKEN_PATTERN: OnceLock<Regex> = OnceLock::new();
 
 impl PreTokenization {
+    /**
+     * Splits the text into pre-tokens, in the order they appear.
+     */
+    pub fn split(text: &str) -> Vec<&str> {
+        TOKEN_PATTERN
+            .get_or_init(|| Regex::new(TOKEN_REGEX).expect("token regex must be valid"))
+            .find_iter(text)
+            .map(|matched| matched.as_str())
+            .collect()
+    }
+
     pub fn count_tokens(text: &str, out: &mut HashMap<String, u64>) {
         TOKEN_PATTERN
             .get_or_init(|| Regex::new(TOKEN_REGEX).expect("token regex must be valid"))
@@ -42,6 +53,15 @@ mod tests {
             *expected.entry(token.to_string()).or_insert(0) += 1;
         }
         assert_eq!(token_map, expected, "input: {input:?}");
+    }
+
+    #[test]
+    fn split_returns_pre_tokens_in_order() {
+        assert_eq!(
+            PreTokenization::split("hello world 123"),
+            vec!["hello", " world", " 123"]
+        );
+        assert!(PreTokenization::split("").is_empty());
     }
 
     #[test]

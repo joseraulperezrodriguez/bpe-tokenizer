@@ -1,4 +1,4 @@
-use crate::{Token, TokenInfo, TokenOcurrences, TokenizationError};
+use crate::{TokenInfo, TokenOcurrences, TokenizationError};
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -17,13 +17,15 @@ pub struct BPETokenizer {
     tokens_id: HashMap<Vec<u8>, u32>,
     // A map of IDs to their corresponding tokens.
     id_tokens: HashMap<u32, Vec<u8>>,
-    // A map of vocabulary, where the key is the token ID and the value is a tuple of (left token ID, optional right token ID).
-    vocabulary: Vec<Token>,
+    // A map of learned merges, where the key is the (left ID, right ID) pair and the value is the merged token ID.
+    // Lower merged IDs were learned earlier, so they have merge priority during encoding.
+    pair_merges: HashMap<(u32, u32), u32>,
     // was initialized
     initialized: bool,
 }
 
 mod candidate_updates;
+mod encoding;
 mod merges;
 mod setup;
 
@@ -36,7 +38,7 @@ impl BPETokenizer {
             max_heap: BinaryHeap::new(),
             tokens_id: HashMap::new(),
             id_tokens: HashMap::new(),
-            vocabulary: Vec::new(),
+            pair_merges: HashMap::new(),
             initialized: false,
         }
     }

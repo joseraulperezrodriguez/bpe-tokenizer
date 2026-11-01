@@ -7,5 +7,4 @@ license = "MIT"
 readme = "README.md"
 
 [dependencies]
-fmt = "0.1.0"
 regex = "1"
