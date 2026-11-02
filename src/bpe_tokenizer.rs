@@ -27,6 +27,7 @@ pub struct BPETokenizer {
 mod candidate_updates;
 mod encoding;
 mod merges;
+mod serialization;
 mod setup;
 
 impl BPETokenizer {
