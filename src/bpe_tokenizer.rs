@@ -60,6 +60,34 @@ impl BPETokenizer {
         self.initialized = true;
         Ok(())
     }
+
+    /**
+     * Number of tokens known to the tokenizer: the 256 base byte tokens
+     * plus every learned merge. This is the size the embedding table of an
+     * LLM consuming this tokenizer must have.
+     */
+    pub fn vocab_size(&self) -> usize {
+        self.id_tokens.len()
+    }
+
+    /**
+     * Trains until the vocabulary reaches @target_vocab_size tokens,
+     * or until no more merges are available in the corpus.
+     */
+    pub fn train(&mut self, target_vocab_size: usize) -> Result<(), TokenizationError> {
+        if !self.initialized {
+            return Err(TokenizationError::UnexpectedError(
+                "The tokenizer must be initialized before training.".to_string(),
+            ));
+        }
+        while self.vocab_size() < target_vocab_size {
+            match self.next_token()? {
+                Some(_) => {}
+                None => break,
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

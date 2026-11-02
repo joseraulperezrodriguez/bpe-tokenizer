@@ -1133,4 +1133,66 @@ mod tests {
 
         assert_eq!(tokenizer.next_token().unwrap(), None);
     }
+
+    #[test]
+    fn vocab_size_counts_base_bytes_plus_learned_merges() {
+        let mut tokenizer = BPETokenizer::new(HashMap::from([("ab".to_string(), 1)]));
+        assert_eq!(tokenizer.vocab_size(), 0);
+
+        tokenizer.initialize().unwrap();
+        assert_eq!(tokenizer.vocab_size(), 256);
+
+        tokenizer.next_token().unwrap().unwrap();
+        assert_eq!(tokenizer.vocab_size(), 257);
+    }
+
+    #[test]
+    fn train_reaches_the_target_vocabulary_size() {
+        // "abcdef" (x2) chains into more merges than the target needs.
+        let mut word_ocurrences = HashMap::new();
+        word_ocurrences.insert("abcdef".to_string(), 2);
+        let mut tokenizer = BPETokenizer::new(word_ocurrences);
+        tokenizer.initialize().unwrap();
+
+        tokenizer.train(260).unwrap();
+
+        assert_eq!(tokenizer.vocab_size(), 260);
+    }
+
+    #[test]
+    fn train_stops_early_when_the_corpus_is_exhausted() {
+        // "ab" can only produce a single merge, so asking for more is fine.
+        let mut word_ocurrences = HashMap::new();
+        word_ocurrences.insert("ab".to_string(), 3);
+        let mut tokenizer = BPETokenizer::new(word_ocurrences);
+        tokenizer.initialize().unwrap();
+
+        tokenizer.train(100_000).unwrap();
+
+        assert_eq!(tokenizer.vocab_size(), 257);
+    }
+
+    #[test]
+    fn train_rejects_an_uninitialized_tokenizer() {
+        let mut tokenizer = BPETokenizer::new(HashMap::new());
+        assert!(tokenizer.train(300).is_err());
+    }
+
+    #[test]
+    fn train_and_encode_end_to_end_via_serialization() {
+        let mut word_ocurrences = HashMap::new();
+        for word in ["the quick brown fox", "the lazy dog", "the fox"] {
+            for part in word.split_whitespace() {
+                *word_ocurrences.entry(part.to_string()).or_insert(0) += 1;
+            }
+        }
+        let mut tokenizer = BPETokenizer::new(word_ocurrences);
+        tokenizer.initialize().unwrap();
+        tokenizer.train(270).unwrap();
+
+        let restored = BPETokenizer::from_bytes(&tokenizer.to_bytes().unwrap()).unwrap();
+        let text = "the quick brown fox";
+        assert_eq!(tokenizer.encode(text), restored.encode(text));
+        assert_eq!(restored.decode_to_string(&restored.encode(text)).unwrap(), text);
+    }
 }
