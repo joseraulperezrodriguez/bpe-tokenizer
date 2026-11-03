@@ -51,12 +51,7 @@ impl BPETokenizer {
             ));
         }
         self.setup();
-        match self.quickoff() {
-            Err(e) => {
-                return Err(e);
-            }
-            Ok(_) => {}
-        }
+        self.quickoff()?;
         self.initialized = true;
         Ok(())
     }

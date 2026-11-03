@@ -71,12 +71,11 @@ impl BPETokenizer {
         // Iterate over all word tokens.
         for (word, word_tokens) in self.word_tokens.iter_mut() {
             // Get the number of ocurrences.
-            let count = match self.word_ocurrences.get(word) {
-                Some(&ocurrences) => ocurrences,
-                None => {
-                    return Err(TokenizationError::WordNotFound(word.clone()));
-                }
-            };
+            let count = self
+                .word_ocurrences
+                .get(word)
+                .copied()
+                .ok_or_else(|| TokenizationError::WordNotFound(word.clone()))?;
 
             if word_tokens.is_empty() {
                 return Err(TokenizationError::UnexpectedError(
@@ -112,15 +111,12 @@ impl BPETokenizer {
         }
         // Insert the initial set of tokens into the tokens heap.
         for token_info in new_tokens {
-            match self.tokens.get(&token_info) {
-                Some(token_ocurrences) => {
-                    self.max_heap
-                        .push((token_ocurrences.get_ocurrences_count(), Reverse(token_info)));
-                }
-                None => {
-                    return Err(TokenizationError::MissingToken(token_info.to_string()));
-                }
-            }
+            let token_ocurrences = self
+                .tokens
+                .get(&token_info)
+                .ok_or_else(|| TokenizationError::MissingToken(token_info.to_string()))?;
+            self.max_heap
+                .push((token_ocurrences.get_ocurrences_count(), Reverse(token_info)));
         }
         Ok(())
     }

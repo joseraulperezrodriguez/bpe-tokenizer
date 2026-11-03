@@ -59,19 +59,13 @@ impl BPETokenizer {
             // its adyacent nodes to update.
             if positions_index > 0 {
                 let (_, prev_right) = &positions[positions_index - 1];
-                match prev_right {
-                    Some(tail) => {
-                        if left == tail && !prev_skipped {
-                            positions_index += 1;
-                            prev_skipped = true;
-                            continue;
-                        }
-                    }
-                    None => {
-                        return Err(TokenizationError::UnexpectedError(
-                            "Unexpected empty right part".to_string(),
-                        ));
-                    }
+                let tail = prev_right.as_ref().ok_or_else(|| {
+                    TokenizationError::UnexpectedError("Unexpected empty right part".to_string())
+                })?;
+                if left == tail && !prev_skipped {
+                    positions_index += 1;
+                    prev_skipped = true;
+                    continue;
                 }
             }
             prev_skipped = false;
@@ -107,40 +101,37 @@ impl BPETokenizer {
                 }
             }
 
-            match right_opt {
-                Some(right) => {
-                    // Move @token_index_left pointer, until it points to the position where @left starts.
-                    while right.get_byte_offset() > &token_index_cumul_right {
-                        token_index_cumul_right += word_tokens[token_index_right].size();
-                        token_index_right += 1;
-                    }
+            let right = right_opt.as_ref().ok_or_else(|| {
+                TokenizationError::UnexpectedError(
+                    "Unexpected empty right part in token.".to_string(),
+                )
+            })?;
 
-                    // only in this case, we confirm there is a token before {right} positions
-                    if token_index_right + 1 < word_tokens.len() {
-                        let token = TokenInfo::new(
-                            word_tokens[token_index_right].to_bytes(),
-                            Some(word_tokens[token_index_right + 1].to_bytes()),
-                        );
-                        if &token != winning_token {
-                            Self::insert_token_ocurrence(
-                                map,
-                                token,
-                                word,
-                                (
-                                    right.clone(),
-                                    Some(OcurrencePosition::new(
-                                        right.get_byte_offset() + right.get_token_length(),
-                                        word_tokens[token_index_right + 1].size(),
-                                    )),
-                                ),
-                            );
-                        }
-                    }
-                }
-                None => {
-                    return Err(TokenizationError::UnexpectedError(
-                        "Unexpected empty right part in token.".to_string(),
-                    ));
+            // Move @token_index_left pointer, until it points to the position where @left starts.
+            while right.get_byte_offset() > &token_index_cumul_right {
+                token_index_cumul_right += word_tokens[token_index_right].size();
+                token_index_right += 1;
+            }
+
+            // only in this case, we confirm there is a token before {right} positions
+            if token_index_right + 1 < word_tokens.len() {
+                let token = TokenInfo::new(
+                    word_tokens[token_index_right].to_bytes(),
+                    Some(word_tokens[token_index_right + 1].to_bytes()),
+                );
+                if &token != winning_token {
+                    Self::insert_token_ocurrence(
+                        map,
+                        token,
+                        word,
+                        (
+                            right.clone(),
+                            Some(OcurrencePosition::new(
+                                right.get_byte_offset() + right.get_token_length(),
+                                word_tokens[token_index_right + 1].size(),
+                            )),
+                        ),
+                    );
                 }
             }
 
@@ -169,36 +160,25 @@ impl BPETokenizer {
             HashMap<String, Vec<(OcurrencePosition, Option<OcurrencePosition>)>>,
         > = HashMap::new();
 
-        // Updating all the tokens that overlaps with the winning token, removing it from the count.
-        match self.tokens.get(&winning_token) {
-            Some(token_ocurrences) => {
-                // iterating over all words and positions where the winning token was formed from.
-                // this allows us to reconstruct the tokens that need to be updated.
-                for (word, winning_token_positions) in token_ocurrences.get_ocurrences() {
-                    match self.word_tokens.get(word) {
-                        Some(word_tokens) => {
-                            match Self::find_and_insert_adyacent_tokens(
-                                &mut to_update,
-                                winning_token,
-                                word,
-                                word_tokens,
-                                winning_token_positions,
-                            ) {
-                                Err(e) => {
-                                    return Err(e);
-                                }
-                                Ok(_) => (),
-                            }
-                        }
-                        None => {
-                            return Err(TokenizationError::WordNotFound(word.clone()));
-                        }
-                    }
-                }
-            }
-            None => {
-                return Err(TokenizationError::MissingToken(winning_token.to_string()));
-            }
+        let token_ocurrences = self
+            .tokens
+            .get(winning_token)
+            .ok_or_else(|| TokenizationError::MissingToken(winning_token.to_string()))?;
+
+        // iterating over all words and positions where the winning token was formed from.
+        // this allows us to reconstruct the tokens that need to be updated.
+        for (word, winning_token_positions) in token_ocurrences.get_ocurrences() {
+            let word_tokens = self
+                .word_tokens
+                .get(word)
+                .ok_or_else(|| TokenizationError::WordNotFound(word.clone()))?;
+            Self::find_and_insert_adyacent_tokens(
+                &mut to_update,
+                winning_token,
+                word,
+                word_tokens,
+                winning_token_positions,
+            )?;
         }
         return Ok(to_update);
     }
@@ -214,60 +194,44 @@ impl BPETokenizer {
         >,
     ) -> Result<(), TokenizationError> {
         for (token_to_update, ocurrences_to_remove) in to_update {
-            match self.tokens.get_mut(&token_to_update) {
-                Some(ocurrences_to_update) => {
-                    // Iterating over the ocurrences of the token that needs to be updated
-                    for word in ocurrences_to_remove.keys() {
-                        let word_ocurrencies = match self.word_ocurrences.get(word) {
-                            Some(wo) => wo.clone(),
-                            None => {
-                                return Err(TokenizationError::WordNotFound(word.clone()));
-                            }
-                        };
-                        let ocurrences_positions_to_update =
-                            match ocurrences_to_update.get_ocurrences().get(word) {
-                                Some(op) => op,
-                                None => {
-                                    return Err(TokenizationError::WordNotFound(word.clone()));
-                                }
-                            };
+            if let Some(ocurrences_to_update) = self.tokens.get_mut(&token_to_update) {
+                // Iterating over the ocurrences of the token that needs to be updated
+                for word in ocurrences_to_remove.keys() {
+                    let word_ocurrencies = self
+                        .word_ocurrences
+                        .get(word)
+                        .copied()
+                        .ok_or_else(|| TokenizationError::WordNotFound(word.clone()))?;
+                    let ocurrences_positions_to_update = ocurrences_to_update
+                        .get_ocurrences()
+                        .get(word)
+                        .ok_or_else(|| TokenizationError::WordNotFound(word.clone()))?;
+                    let positions_to_remove = ocurrences_to_remove
+                        .get(word)
+                        .ok_or_else(|| TokenizationError::WordNotFound(word.clone()))?;
 
-                        // Finding the ocurrence to remove for the current word and token
-                        let mut final_positions: Vec<(
-                            OcurrencePosition,
-                            Option<OcurrencePosition>,
-                        )> = Vec::new();
-                        match ocurrences_to_remove.get(word) {
-                            Some(positions_to_remove) => {
-                                let mut rem_index: usize = 0;
-                                for ocurrence_position in ocurrences_positions_to_update {
-                                    if rem_index < positions_to_remove.len()
-                                        && positions_to_remove[rem_index] == *ocurrence_position
-                                    {
-                                        // removing this one.
-                                        rem_index += 1;
-                                        continue;
-                                    }
-                                    final_positions.push(ocurrence_position.clone());
-                                }
-                                match ocurrences_to_update.replace_positions(
-                                    word.clone(),
-                                    word_ocurrencies,
-                                    final_positions,
-                                ) {
-                                    Result::Ok(_) => (),
-                                    Err(err) => {
-                                        return Err(err);
-                                    }
-                                }
-                            }
-                            None => {
-                                return Err(TokenizationError::WordNotFound(word.clone()));
-                            }
+                    // Finding the ocurrence to remove for the current word and token
+                    let mut final_positions: Vec<(
+                        OcurrencePosition,
+                        Option<OcurrencePosition>,
+                    )> = Vec::new();
+                    let mut rem_index: usize = 0;
+                    for ocurrence_position in ocurrences_positions_to_update {
+                        if rem_index < positions_to_remove.len()
+                            && positions_to_remove[rem_index] == *ocurrence_position
+                        {
+                            // removing this one.
+                            rem_index += 1;
+                            continue;
                         }
+                        final_positions.push(ocurrence_position.clone());
                     }
+                    ocurrences_to_update.replace_positions(
+                        word.clone(),
+                        word_ocurrencies,
+                        final_positions,
+                    )?;
                 }
-                None => {}
             }
         }
         Ok(())
