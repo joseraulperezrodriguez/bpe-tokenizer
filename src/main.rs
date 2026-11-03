@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -78,23 +78,32 @@ fn resolve_output_path(path: &Path) -> Result<PathBuf, String> {
 /**
  * Collects the corpus files to read: @path itself if it is a file,
  * or every file under it (recursively, in sorted order) if it is a directory.
+ *
+ * Every visited path is resolved to its canonical form and remembered in
+ * @visited, so a directory or file that is reachable through multiple paths
+ * (including symlinks and directory cycles, e.g. a link back to an ancestor)
+ * is walked exactly once. This terminates cycles and prevents counting the
+ * same content twice in the word counts.
  */
 fn collect_files(
     path: &Path,
     output_path: &Path,
     out: &mut Vec<PathBuf>,
+    visited: &mut HashSet<PathBuf>,
 ) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path)
+    // Following the metadata (fs::metadata, not symlink_metadata) means links
+    // resolve to their targets; the @visited set makes that safe.
+    let metadata = fs::metadata(path)
         .map_err(|e| format!("Failed to access corpus path {}: {}", path.display(), e))?;
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() {
-        return Err(format!(
-            "Symlinks are not supported in corpus paths: {}",
-            path.display()
-        ));
-    }
 
-    if file_type.is_dir() {
+    if metadata.is_dir() {
+        let canonical_path = fs::canonicalize(path).map_err(|e| {
+            format!("Failed to resolve corpus directory {}: {}", path.display(), e)
+        })?;
+        if !visited.insert(canonical_path) {
+            // Already walked this directory, possibly through a link or cycle.
+            return Ok(());
+        }
         let mut entries: Vec<PathBuf> = fs::read_dir(path)
             .map_err(|e| format!("Failed to read directory {}: {}", path.display(), e))?
             .map(|entry| {
@@ -106,12 +115,12 @@ fn collect_files(
         // Sorted for deterministic training runs.
         entries.sort();
         for entry in entries {
-            collect_files(&entry, output_path, out)?;
+            collect_files(&entry, output_path, out, visited)?;
         }
-    } else if file_type.is_file() {
+    } else if metadata.is_file() {
         let canonical_path = fs::canonicalize(path)
             .map_err(|e| format!("Failed to resolve corpus file {}: {}", path.display(), e))?;
-        if canonical_path != output_path {
+        if canonical_path != output_path && visited.insert(canonical_path.clone()) {
             out.push(canonical_path);
         }
     } else {
@@ -127,7 +136,8 @@ fn run(corpus_path: &Path, model_path: &str, vocab_size: usize, skip_tags: bool)
     // 1. Resolve the corpus files.
     let output_path = resolve_output_path(Path::new(model_path))?;
     let mut files: Vec<PathBuf> = Vec::new();
-    collect_files(corpus_path, &output_path, &mut files)?;
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    collect_files(corpus_path, &output_path, &mut files, &mut visited)?;
     if files.is_empty() {
         return Err("Corpus path contains no files.".to_string());
     }
@@ -235,14 +245,15 @@ mod tests {
 
         let output_path = resolve_output_path(&model_file).unwrap();
         let mut files = Vec::new();
-        collect_files(&root, &output_path, &mut files).unwrap();
+        let mut visited = HashSet::new();
+        collect_files(&root, &output_path, &mut files, &mut visited).unwrap();
 
         assert_eq!(files, vec![fs::canonicalize(corpus_file).unwrap()]);
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn collect_files_rejects_symlinks() {
+    fn collect_files_terminates_on_directory_cycles() {
         let root = temporary_directory();
         fs::create_dir_all(&root).unwrap();
         let link = root.join("loop");
@@ -259,9 +270,42 @@ mod tests {
 
         let output_path = resolve_output_path(&root.join("model.bin")).unwrap();
         let mut files = Vec::new();
-        let result = collect_files(&root, &output_path, &mut files);
+        let mut visited = HashSet::new();
+        collect_files(&root, &output_path, &mut files, &mut visited).unwrap();
 
-        assert!(result.unwrap_err().contains("Symlinks are not supported"));
+        // The cycle resolves to the already visited root: no infinite
+        // recursion, no duplicated files.
+        assert!(files.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn collect_files_walks_linked_directories_only_once() {
+        let root = temporary_directory();
+        let dir = root.join("a");
+        fs::create_dir_all(&dir).unwrap();
+        let corpus_file = dir.join("corpus.txt");
+        fs::write(&corpus_file, "corpus").unwrap();
+        let link = root.join("link-to-a");
+
+        #[cfg(unix)]
+        let link_result = std::os::unix::fs::symlink(&dir, &link);
+        #[cfg(windows)]
+        let link_result = std::os::windows::fs::symlink_dir(&dir, &link);
+
+        if link_result.is_err() {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+
+        let output_path = resolve_output_path(&root.join("model.bin")).unwrap();
+        let mut files = Vec::new();
+        let mut visited = HashSet::new();
+        collect_files(&root, &output_path, &mut files, &mut visited).unwrap();
+
+        // The same file is reachable through a/ and link-to-a/ but is
+        // collected exactly once.
+        assert_eq!(files, vec![fs::canonicalize(&corpus_file).unwrap()]);
         fs::remove_dir_all(root).unwrap();
     }
 }
