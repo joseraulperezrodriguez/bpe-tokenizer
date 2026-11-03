@@ -1195,4 +1195,38 @@ mod tests {
         assert_eq!(tokenizer.encode(text), restored.encode(text));
         assert_eq!(restored.decode_to_string(&restored.encode(text)).unwrap(), text);
     }
+
+    #[test]
+    fn train_survives_a_winner_with_adjacent_occurrences() {
+        // Regression test for a state inconsistency that crashed training with
+        // WordNotFound. "ar" wins first and has two ADJACENT occurrences in
+        // "ararap" ([0,2) and [2,4)), so the pair between them, (r,a) at byte 1,
+        // is inserted twice into the update list (once per neighboring
+        // occurrence). The ordered removal loop then mis-syncs and keeps the
+        // (r,a) occurrence at byte 3, whose pair the merge destroyed. When (r,a)
+        // later wins, that stale occurrence produces a phantom update that
+        // deletes the live (a,p) entry for "ararap", and the next winner
+        // adjacent to the still-existing (a,p) pair fails with WordNotFound.
+        let mut word_ocurrences = HashMap::new();
+        word_ocurrences.insert("ararap".to_string(), 1);
+        word_ocurrences.insert("ar".to_string(), 10);
+        word_ocurrences.insert("ra".to_string(), 2);
+        word_ocurrences.insert("ap".to_string(), 1);
+        let mut tokenizer = BPETokenizer::new(word_ocurrences);
+        tokenizer.initialize().unwrap();
+
+        // Before the fix this failed at the 4th merge (vocab size 260)
+        // with `WordNotFound: ararap`.
+        let trained = tokenizer.train(1000);
+        assert!(
+            trained.is_ok(),
+            "training failed: {:?}",
+            trained.err()
+        );
+        // The corpus chains into a handful of merges and is then exhausted.
+        assert!(tokenizer.vocab_size() < 1000);
+        // The victim word still round-trips after training.
+        let ids = tokenizer.encode("ararap");
+        assert_eq!(tokenizer.decode_to_string(&ids).unwrap(), "ararap");
+    }
 }

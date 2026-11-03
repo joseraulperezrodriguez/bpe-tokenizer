@@ -71,6 +71,8 @@ impl BPETokenizer {
         for id in ids {
             match self.id_tokens.get(id) {
                 Some(token_bytes) => bytes.extend_from_slice(token_bytes),
+                // encode() can emit base-byte IDs before initialize() populates id_tokens.
+                None if *id <= u8::MAX as u32 => bytes.push(*id as u8),
                 None => return Err(TokenizationError::UnknownTokenId(*id)),
             }
         }
@@ -115,6 +117,17 @@ mod tests {
         let ids = tokenizer.encode("hi");
         assert_eq!(ids, vec![u32::from(b'h'), u32::from(b'i')]);
         assert_eq!(tokenizer.decode_to_string(&ids).unwrap(), "hi");
+    }
+
+    #[test]
+    fn decode_accepts_base_byte_ids_before_initialization() {
+        let tokenizer = BPETokenizer::new(HashMap::new());
+
+        assert_eq!(tokenizer.decode(&[104, 105]).unwrap(), b"hi");
+        assert!(matches!(
+            tokenizer.decode(&[256]),
+            Err(crate::TokenizationError::UnknownTokenId(256))
+        ));
     }
 
     #[test]

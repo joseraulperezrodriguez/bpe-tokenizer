@@ -21,6 +21,12 @@ use super::BPETokenizer;
 
 const MAGIC: &[u8; 4] = b"BPET";
 const FORMAT_VERSION: u32 = 1;
+// Header = 4-byte magic + 4-byte version + 4-byte merge count.
+const HEADER_SIZE: usize = MAGIC.len() + 2 * std::mem::size_of::<u32>();
+// Each merge stores a 4-byte left ID and a 4-byte right ID.
+const MERGE_ENTRY_SIZE: usize = 2 * std::mem::size_of::<u32>();
+// Learned IDs start at 256; N merges use IDs 256 through 255 + N.
+const MAX_MERGE_COUNT: u32 = u32::MAX - 255;
 
 impl BPETokenizer {
     /**
@@ -37,6 +43,16 @@ impl BPETokenizer {
 
         // The learned merge list, indexed by merged token ID - 256.
         let merge_count = self.pair_merges.len();
+        // The serialized header stores a u32 count; the same bound also ensures
+        // the highest learned ID (255 + merge_count) fits in u32.
+        let merge_count_u32 = u32::try_from(merge_count).map_err(|_| {
+            TokenizationError::UnexpectedError("Merge list exceeds the token ID range.".to_string())
+        })?;
+        if merge_count_u32 > MAX_MERGE_COUNT {
+            return Err(TokenizationError::UnexpectedError(
+                "Merge list exceeds the token ID range.".to_string(),
+            ));
+        }
         let mut merge_list: Vec<(u32, u32)> = vec![(0, 0); merge_count];
         for ((left_id, right_id), merged_id) in &self.pair_merges {
             let index = match merged_id.checked_sub(256) {
@@ -57,10 +73,17 @@ impl BPETokenizer {
             merge_list[index] = (*left_id, *right_id);
         }
 
-        let mut buffer: Vec<u8> = Vec::with_capacity(12 + merge_count * 8);
+        // Check the capacity arithmetic before allocating the serialized byte buffer.
+        let capacity = merge_count
+            .checked_mul(MERGE_ENTRY_SIZE)
+            .and_then(|entries_size| HEADER_SIZE.checked_add(entries_size))
+            .ok_or_else(|| {
+                TokenizationError::UnexpectedError("Serialized model is too large.".to_string())
+            })?;
+        let mut buffer: Vec<u8> = Vec::with_capacity(capacity);
         buffer.extend_from_slice(MAGIC);
         buffer.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        buffer.extend_from_slice(&(merge_count as u32).to_le_bytes());
+        buffer.extend_from_slice(&merge_count_u32.to_le_bytes());
         for (left_id, right_id) in merge_list {
             buffer.extend_from_slice(&left_id.to_le_bytes());
             buffer.extend_from_slice(&right_id.to_le_bytes());
@@ -89,7 +112,29 @@ impl BPETokenizer {
                 version
             )));
         }
-        let merge_count = reader.read_u32()? as usize;
+        let merge_count_u32 = reader.read_u32()?;
+        // The highest learned ID is 255 + merge_count; keep it in the u32 ID range.
+        if merge_count_u32 > MAX_MERGE_COUNT {
+            return Err(TokenizationError::InvalidModel(
+                "Merge list exceeds the token ID range.".to_string(),
+            ));
+        }
+        let merge_count = usize::try_from(merge_count_u32).map_err(|_| {
+            TokenizationError::InvalidModel("Merge list is too large.".to_string())
+        })?;
+        // reader.pos tracks bytes consumed; after the header, the rest must be
+        // exactly merge_count entries, each containing two u32 IDs.
+        let remaining_bytes = reader.data.len() - reader.pos;
+        let expected_merge_bytes = merge_count.checked_mul(MERGE_ENTRY_SIZE).ok_or_else(|| {
+            TokenizationError::InvalidModel("Merge list is too large.".to_string())
+        })?;
+        if remaining_bytes != expected_merge_bytes {
+            return Err(TokenizationError::InvalidModel(if remaining_bytes < expected_merge_bytes {
+                "Model data is truncated.".to_string()
+            } else {
+                "Trailing data after the merge list.".to_string()
+            }));
+        }
         let mut merges: Vec<(u32, u32)> = Vec::with_capacity(merge_count);
         for index in 0..merge_count {
             let merged_id = 256 + index as u32;
@@ -103,12 +148,6 @@ impl BPETokenizer {
             }
             merges.push((left_id, right_id));
         }
-        if reader.pos != reader.data.len() {
-            return Err(TokenizationError::InvalidModel(
-                "Trailing data after the merge list.".to_string(),
-            ));
-        }
-
         // Rebuild the base vocabulary and the byte content of every learned token.
         let mut id_tokens: HashMap<u32, Vec<u8>> = HashMap::new();
         for byte in u8::MIN..=u8::MAX {
@@ -303,6 +342,18 @@ mod tests {
         ));
         assert!(matches!(
             BPETokenizer::from_bytes(&[]),
+            Err(TokenizationError::InvalidModel(_))
+        ));
+    }
+
+    #[test]
+    fn from_bytes_rejects_impossible_merge_count_before_allocation() {
+        let mut model = b"BPET".to_vec();
+        model.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        model.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        assert!(matches!(
+            BPETokenizer::from_bytes(&model),
             Err(TokenizationError::InvalidModel(_))
         ));
     }

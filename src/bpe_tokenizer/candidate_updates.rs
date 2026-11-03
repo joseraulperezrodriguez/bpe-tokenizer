@@ -49,6 +49,8 @@ impl BPETokenizer {
 
         let mut positions_index = 0;
         let mut prev_skipped = false;
+        let mut last_inserted: Option<(TokenInfo, (OcurrencePosition, Option<OcurrencePosition>))> =
+            None;
 
         // We iterate over all positions and form its left and right adyacent tokens.
         while positions_index < positions.len() {
@@ -86,18 +88,17 @@ impl BPETokenizer {
                     Some(word_tokens[token_index_left].to_bytes()),
                 );
                 if &token != winning_token {
-                    Self::insert_token_ocurrence(
-                        map,
-                        token,
-                        word,
-                        (
-                            OcurrencePosition::new(
-                                left.get_byte_offset() - word_tokens[token_index_left - 1].size(),
-                                word_tokens[token_index_left - 1].size(),
-                            ),
-                            Some(left.clone()),
+                    let pos = (
+                        OcurrencePosition::new(
+                            left.get_byte_offset() - word_tokens[token_index_left - 1].size(),
+                            word_tokens[token_index_left - 1].size(),
                         ),
+                        Some(left.clone()),
                     );
+                    if last_inserted.as_ref() != Some(&(token.clone(), pos.clone())) {
+                        Self::insert_token_ocurrence(map, token.clone(), word, pos.clone());
+                        last_inserted = Some((token, pos));
+                    }
                 }
             }
 
@@ -120,18 +121,17 @@ impl BPETokenizer {
                     Some(word_tokens[token_index_right + 1].to_bytes()),
                 );
                 if &token != winning_token {
-                    Self::insert_token_ocurrence(
-                        map,
-                        token,
-                        word,
-                        (
-                            right.clone(),
-                            Some(OcurrencePosition::new(
-                                right.get_byte_offset() + right.get_token_length(),
-                                word_tokens[token_index_right + 1].size(),
-                            )),
-                        ),
+                    let pos = (
+                        right.clone(),
+                        Some(OcurrencePosition::new(
+                            right.get_byte_offset() + right.get_token_length(),
+                            word_tokens[token_index_right + 1].size(),
+                        )),
                     );
+                    if last_inserted.as_ref() != Some(&(token.clone(), pos.clone())) {
+                        Self::insert_token_ocurrence(map, token.clone(), word, pos.clone());
+                        last_inserted = Some((token, pos));
+                    }
                 }
             }
 
