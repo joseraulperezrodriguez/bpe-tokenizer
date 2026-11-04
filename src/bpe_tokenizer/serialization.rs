@@ -150,8 +150,10 @@ impl BPETokenizer {
         }
         // Rebuild the base vocabulary and the byte content of every learned token.
         let mut id_tokens: HashMap<u32, Vec<u8>> = HashMap::new();
+        let mut token_sizes: Vec<u32> = Vec::with_capacity(256 + merge_count);
         for byte in u8::MIN..=u8::MAX {
             id_tokens.insert(u32::from(byte), vec![byte]);
+            token_sizes.push(1);
         }
         let mut pair_merges: HashMap<(u32, u32), u32> = HashMap::with_capacity(merge_count);
         for (index, (left_id, right_id)) in merges.into_iter().enumerate() {
@@ -169,6 +171,7 @@ impl BPETokenizer {
                     merged_id, right_id
                 ))
             })?);
+            token_sizes.push(token_bytes.len() as u32);
             id_tokens.insert(merged_id, token_bytes);
             pair_merges.insert((left_id, right_id), merged_id);
         }
@@ -178,12 +181,14 @@ impl BPETokenizer {
         }
 
         Ok(Self {
-            word_ocurrences: HashMap::new(),
+            words: Vec::new(),
+            word_freqs: Vec::new(),
+            word_tokens: Vec::new(),
             tokens: HashMap::new(),
-            word_tokens: HashMap::new(),
             max_heap: Default::default(),
             tokens_id,
             id_tokens,
+            token_sizes,
             pair_merges,
             initialized: true,
         })

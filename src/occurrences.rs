@@ -1,41 +1,18 @@
 use std::collections::HashMap;
 
-use crate::{TokenizationError};
+use crate::TokenizationError;
 
 /**
- * It defines where an ocurrence is located inside a word.
- */
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct OcurrencePosition {
-  // Byte offset within the UTF-8 word.
-  byte_offset: usize,
-  // Number of bytes in the token.
-  token_length: usize,
-}
-
-impl OcurrencePosition {
-    pub fn new(byte_offset: usize, token_length: usize) -> Self {
-      Self { byte_offset, token_length }
-    }
-
-    pub fn get_byte_offset(&self) -> &usize {
-      &self.byte_offset
-    }
-
-    pub fn get_token_length(&self) -> &usize {
-      &self.token_length
-    }
-}
-
-/**
- * It defines the ocurrences info of a token.
+ * It defines the ocurrences info of a candidate token pair.
+ * An occurrence is identified by the byte offset (of the pair's left part)
+ * within the word; the lengths of both parts are derivable from the token
+ * registry, so they are not stored per occurrence.
  */
 #[derive(Clone, Debug, Default)]
 pub struct TokenOcurrences {
-    // Key: word, Value: positions within that word where the token appeared.
-    // The tokens are stored as a pair; the parts that forms the token.
-    tokens_word_ocurrences: HashMap<String, Vec<(OcurrencePosition, Option<OcurrencePosition>)>>,
-    // The number of ocurrences of the associated token, taking into account the frequency of each word in the corpus
+    // Key: word id, Value: ascending byte offsets where the pair appears in the word.
+    tokens_word_ocurrences: HashMap<u32, Vec<u32>>,
+    // The number of ocurrences of the pair, taking into account the frequency of each word in the corpus
     // formule for word {w} with frequency freq(w) = len(tokens_word_ocurrences[w]) * freq(w).
     count_ocurrences: u64,
 }
@@ -52,50 +29,48 @@ impl TokenOcurrences {
         self.count_ocurrences
     }
 
-    pub fn get_ocurrences(
-        &self,
-    ) -> &HashMap<String, Vec<(OcurrencePosition, Option<OcurrencePosition>)>> {
+    pub fn get_ocurrences(&self) -> &HashMap<u32, Vec<u32>> {
         &self.tokens_word_ocurrences
     }
 
     /**
-     * It adds an ocurrence of the tokenn described by @position, to the list of ocurrences for the given @word
-     * Using the @word_frequency count.
+     * It adds an ocurrence of the pair at @byte_offset inside the word with id @word_id,
+     * using its corpus frequency @word_frequency for the global count.
      */
-    pub fn add_ocurrence(
-        &mut self,
-        word: String,
-        word_frequency: u64,
-        position: (OcurrencePosition, Option<OcurrencePosition>),
-    ) {
+    pub fn add_ocurrence(&mut self, word_id: u32, word_frequency: u64, byte_offset: u32) {
         self.tokens_word_ocurrences
-            .entry(word)
+            .entry(word_id)
             .or_default()
-            .push(position);
+            .push(byte_offset);
         self.count_ocurrences += word_frequency;
     }
 
     /**
-     * We completely the previous existing ocurrences of the given word, with a new list of ocurrences. 
-     * */
-    pub fn replace_positions(&mut self, word: String, word_ocurrencies: u64, new_pos: Vec<(OcurrencePosition, Option<OcurrencePosition>)>) -> Result<(), TokenizationError> {
+     * It replaces the previous offsets of the given word with a new list of offsets.
+     */
+    pub fn replace_positions(
+        &mut self,
+        word_id: u32,
+        word_ocurrencies: u64,
+        new_offsets: Vec<u32>,
+    ) -> Result<(), TokenizationError> {
+        let prev_count = match self.tokens_word_ocurrences.get(&word_id) {
+            Some(prev_offsets) => prev_offsets.len() as u64,
+            None => {
+                return Err(TokenizationError::UnexpectedError(format!(
+                    "Word id {} not found in the ocurrences list.",
+                    word_id
+                )));
+            }
+        };
+        self.count_ocurrences -= prev_count * word_ocurrencies;
+        self.count_ocurrences += new_offsets.len() as u64 * word_ocurrencies;
 
-       let prev_count = match self.tokens_word_ocurrences.get(&word) {
-         Some(prev_positions) => {
-            prev_positions.len() as u64
-         }
-         None => {
-            return Err(TokenizationError::WordNotFound(word));
-         }
-       };
-       self.count_ocurrences -= prev_count * word_ocurrencies;
-       self.count_ocurrences += new_pos.len() as u64 * word_ocurrencies;
-
-       self.tokens_word_ocurrences.remove(&word);
-       if new_pos.len() > 0 {
-         self.tokens_word_ocurrences.insert(word,  new_pos);
-       }
-       return Ok(());
+        self.tokens_word_ocurrences.remove(&word_id);
+        if !new_offsets.is_empty() {
+            self.tokens_word_ocurrences.insert(word_id, new_offsets);
+        }
+        Ok(())
     }
 }
 
@@ -106,53 +81,54 @@ mod tests {
     #[test]
     fn test_add_token_ocurrences() {
         let mut token_ocurrences = TokenOcurrences::new();
-        token_ocurrences.add_ocurrence(
-            " word".to_string(),
-            1,
-            (
-                OcurrencePosition::new(0, 1),
-                Some(OcurrencePosition::new(1, 1)),
-            ),
-        );
-        token_ocurrences.add_ocurrence(
-            " word".to_string(),
-            1,
-            (
-                OcurrencePosition::new(1, 1),
-                Some(OcurrencePosition::new(2, 1)),
-            ),
-        );
+        // Word id 7, offsets 0 and 1.
+        token_ocurrences.add_ocurrence(7, 1, 0);
+        token_ocurrences.add_ocurrence(7, 1, 1);
         assert_eq!(token_ocurrences.get_ocurrences_count(), 2);
 
-        let word_ocurrences = token_ocurrences.get_ocurrences().get(" word");
+        let word_ocurrences = token_ocurrences.get_ocurrences().get(&7);
         assert!(word_ocurrences.is_some());
-        assert_eq!(
-            word_ocurrences.unwrap().as_slice(),
-            &[
-                (
-                    OcurrencePosition::new(0, 1),
-                    Some(OcurrencePosition::new(1, 1)),
-                ),
-                (
-                    OcurrencePosition::new(1, 1),
-                    Some(OcurrencePosition::new(2, 1)),
-                ),
-            ]
-        );
+        assert_eq!(word_ocurrences.unwrap().as_slice(), &[0, 1]);
+    }
+
+    #[test]
+    fn add_ocurrence_scales_counts_by_word_frequency() {
+        let mut token_ocurrences = TokenOcurrences::new();
+        token_ocurrences.add_ocurrence(3, 5, 0);
+        token_ocurrences.add_ocurrence(3, 5, 4);
+        assert_eq!(token_ocurrences.get_ocurrences_count(), 10);
     }
 
     #[test]
     fn test_replace_positions() {
         let mut ocurrences = TokenOcurrences::new();
-        let word = "wow".to_string();
-        ocurrences.add_ocurrence(word.clone(), 3, (OcurrencePosition::new(0, 1), None));
-        ocurrences.add_ocurrence(word.clone(), 3, (OcurrencePosition::new(1, 1), None));
-        ocurrences.add_ocurrence(word.clone(), 3, (OcurrencePosition::new(2, 1), None));
+        ocurrences.add_ocurrence(2, 3, 0);
+        ocurrences.add_ocurrence(2, 3, 1);
+        ocurrences.add_ocurrence(2, 3, 2);
 
-        let new_pos = vec![(OcurrencePosition::new(0, 1), None::<OcurrencePosition>)];
-
-        let res = ocurrences.replace_positions(word.clone(), 3, new_pos); 
+        let res = ocurrences.replace_positions(2, 3, vec![0]);
         assert!(res.is_ok());
-        assert!(ocurrences.get_ocurrences_count() == 3);
+        assert_eq!(ocurrences.get_ocurrences_count(), 3);
+        assert_eq!(ocurrences.get_ocurrences().get(&2).unwrap().as_slice(), &[0]);
+    }
+
+    #[test]
+    fn replace_positions_drops_empty_word_entries() {
+        let mut ocurrences = TokenOcurrences::new();
+        ocurrences.add_ocurrence(2, 3, 0);
+        ocurrences.add_ocurrence(2, 3, 1);
+
+        ocurrences.replace_positions(2, 3, vec![]).unwrap();
+
+        assert_eq!(ocurrences.get_ocurrences_count(), 0);
+        assert!(!ocurrences.get_ocurrences().contains_key(&2));
+    }
+
+    #[test]
+    fn replace_positions_rejects_an_unknown_word() {
+        let mut ocurrences = TokenOcurrences::new();
+        ocurrences.add_ocurrence(2, 3, 0);
+
+        assert!(ocurrences.replace_positions(9, 3, vec![0]).is_err());
     }
 }

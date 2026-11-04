@@ -1,42 +1,11 @@
 use std::cmp::Reverse;
 use std::collections::HashSet;
 
-use crate::{OcurrencePosition, TokenInfo, TokenizationError};
+use crate::{TokenInfo, TokenizationError};
 
 use super::BPETokenizer;
 
 impl BPETokenizer {
-    /**
-     * Given a token candidate, find which token ids it was formed from.
-     * The left and right token must exists in the id registry.
-     */
-    pub(super) fn token_parts(
-        &self,
-        winning_token: &TokenInfo,
-    ) -> Result<(u32, u32), TokenizationError> {
-        let left_id = self
-            .tokens_id
-            .get(winning_token.get_left())
-            .copied()
-            .ok_or_else(|| {
-                TokenizationError::MissingToken(
-                    String::from_utf8_lossy(winning_token.get_left()).into_owned(),
-                )
-            })?;
-        let right_bytes = winning_token
-            .get_right()
-            .ok_or_else(|| TokenizationError::MissingToken(winning_token.to_string()))?;
-        let right_id = self
-            .tokens_id
-            .get(right_bytes)
-            .copied()
-            .ok_or_else(|| {
-                // At this point all tokens are composed by left and right.
-                TokenizationError::MissingToken(String::from_utf8_lossy(right_bytes).into_owned())
-            })?;
-        Ok((left_id, right_id))
-    }
-
     /**
      * Keep poping from the max heap until it finds an element count that matches what is in the
      * actual count.
@@ -48,20 +17,24 @@ impl BPETokenizer {
         while !self.max_heap.is_empty() {
             match self.max_heap.pop() {
                 Some((count, Reverse(token_info))) => {
-                    match self.tokens.get(&token_info) {
-                        Some(tm) => {
-                            if tm.get_ocurrences_count() == count {
+                    // The heap can contain stale entries after a pair was removed,
+                    // and unresolvable entries are skipped the same way.
+                    let Some(pair) = self.pair_of(&token_info) else {
+                        continue;
+                    };
+                    match self.tokens.get(&pair) {
+                        Some(ocurrences) => {
+                            if ocurrences.get_ocurrences_count() == count {
                                 return Ok(Some(token_info));
                             }
-                            if tm.get_ocurrences_count() > 0 {
+                            if ocurrences.get_ocurrences_count() > 0 {
                                 self.max_heap
-                                    .push((tm.get_ocurrences_count(), Reverse(token_info)));
+                                    .push((ocurrences.get_ocurrences_count(), Reverse(token_info)));
                             } else {
-                                self.tokens.remove(&token_info);
+                                self.tokens.remove(&pair);
                             }
                         }
                         None => {
-                            // The heap can contain stale entries after a token was removed.
                             continue;
                         }
                     }
@@ -76,165 +49,161 @@ impl BPETokenizer {
         Ok(None)
     }
 
+    /**
+     * It merges every occurrence of the winning pair in every word where it
+     * appears, and generates new candidates from the tokens that became
+     * adjacent after the merge.
+     */
     pub(super) fn merge_winning_token_and_generate_new_ones(
         &mut self,
-        winning_token: &TokenInfo,
+        pair: (u32, u32),
     ) -> Result<(), TokenizationError> {
-        // Update the word tokens and generate new token from winning token adyacent ones.
-        let mut new_tokens: HashSet<TokenInfo> = HashSet::new();
-        let mut pending_tokens = Vec::new();
+        // The merged token id was registered in the vocabulary before this call.
+        let winner_id = self
+            .pair_merges
+            .get(&pair)
+            .copied()
+            .ok_or_else(|| TokenizationError::MissingToken(String::from_utf8_lossy(
+                &self.pair_token_info(pair).to_bytes(),
+            ).into_owned()))?;
 
-        let winning_token_ocurrences = self
-            .tokens
-            .get(winning_token)
-            .ok_or_else(|| {
-                TokenizationError::UnexpectedError("Unexpected non existing token.".to_string())
+        // New candidate pairs collected while merging, pushed to the heap at the end.
+        let mut new_pairs: HashSet<(u32, u32)> = HashSet::new();
+        // Occurrences are collected first to avoid holding borrows while mutating.
+        let mut word_occurrences: Vec<(u32, Vec<u32>)> = Vec::new();
+        match self.tokens.get(&pair) {
+            Some(pair_ocurrences) => {
+                for (word_id, offsets) in pair_ocurrences.get_ocurrences() {
+                    word_occurrences.push((*word_id, offsets.clone()));
+                }
+            }
+            None => {
+                return Err(TokenizationError::UnexpectedError(
+                    "Unexpected non existing token.".to_string(),
+                ));
+            }
+        }
+
+        for (word_id, offsets) in word_occurrences {
+            let word_freq = self.word_freqs.get(word_id as usize).copied().ok_or_else(|| {
+                TokenizationError::UnexpectedError(format!(
+                    "Unexpected missing word id {}.",
+                    word_id
+                ))
+            })?;
+            let tokens = self.word_tokens.get(word_id as usize).cloned().ok_or_else(|| {
+                TokenizationError::UnexpectedError(format!(
+                    "Unexpected missing word id {}.",
+                    word_id
+                ))
             })?;
 
-        // iterating over all words in which the winning token is present.
-        for (word, wining_token_ocurrences_positions) in
-            winning_token_ocurrences.get_ocurrences()
-        {
-            let word_ocurrences = self
-                .word_ocurrences
-                .get(word)
-                .copied()
-                .ok_or_else(|| TokenizationError::WordNotFound(word.to_string()))?;
-            let tokens = self
-                .word_tokens
-                .get(word)
-                .ok_or_else(|| {
-                    TokenizationError::UnexpectedError("Unexpected missing word".to_string())
-                })?;
-
             let mut index = 0;
-            let mut byte_count = 0;
+            let mut byte_count: u32 = 0;
             let mut ocurrences_id = 0;
             let mut prev_new_token = false;
 
-            let mut final_tokens: Vec<TokenInfo> = Vec::new();
+            let mut final_tokens: Vec<u32> = Vec::new();
+            // (pair, word_id, word_freq, byte_offset) of candidates formed around the merges.
+            let mut pending: Vec<((u32, u32), u32, u64, u32)> = Vec::new();
 
             while index < tokens.len() {
-                // position the ocurrence_id at the same index of the token id.
-                while ocurrences_id < wining_token_ocurrences_positions.len()
-                    && &byte_count
-                        > wining_token_ocurrences_positions[ocurrences_id]
-                            .0
-                            .get_byte_offset()
-                {
+                // position the ocurrence_id at the first occurrence at or after the current token.
+                while ocurrences_id < offsets.len() && byte_count > offsets[ocurrences_id] {
                     ocurrences_id += 1;
                 }
 
                 // at this point we know that we can merge tokens at index and index+1
-                if ocurrences_id < wining_token_ocurrences_positions.len()
-                    && &byte_count
-                        == wining_token_ocurrences_positions[ocurrences_id]
-                            .0
-                            .get_byte_offset()
-                {
-                    // merging winning tokens part into one token
-                    let new_token = TokenInfo::new(
-                        tokens[index].to_bytes(),
-                        Some(tokens[index + 1].to_bytes()),
-                    );
-                    if final_tokens.len() > 0 {
-                        // if there is a previous token, we merge it with the winning token, resulting in a branch new token.
-                        let left = final_tokens[final_tokens.len() - 1].clone();
-                        // position where this new token appears.
-                        let position = (
-                            OcurrencePosition::new(byte_count - left.size(), left.size()),
-                            Some(OcurrencePosition::new(byte_count, new_token.size())),
-                        );
-                        pending_tokens.push((
-                            left,
-                            new_token.clone(),
-                            word.clone(),
-                            word_ocurrences,
-                            position,
+                if ocurrences_id < offsets.len() && byte_count == offsets[ocurrences_id] {
+                    // merging the winning pair parts into the winning token
+                    if !final_tokens.is_empty() {
+                        // if there is a previous token, we merge it with the winning token, resulting in a brand new candidate.
+                        let left = final_tokens[final_tokens.len() - 1];
+                        let left_size = self.token_size(left);
+                        pending.push((
+                            (left, winner_id),
+                            word_id,
+                            word_freq,
+                            byte_count - left_size,
                         ));
                     }
-                    final_tokens.push(new_token);
+                    final_tokens.push(winner_id);
                     prev_new_token = true;
 
                     // we advance 1 extra position here so next iteration falls at a new ocurrence, not at the second part of this ocurrence.
-                    byte_count += tokens[index].size();
+                    byte_count += self.token_size(tokens[index]);
                     index += 1;
                 } else {
                     // This means the ocurrences of the tokens to merge is to the right of the current token index
-                    if final_tokens.len() > 0 && prev_new_token {
-                        let left = final_tokens[final_tokens.len() - 1].clone();
-                        let position = (
-                            OcurrencePosition::new(byte_count - left.size(), left.size()),
-                            Some(OcurrencePosition::new(byte_count, tokens[index].size())),
-                        );
-                        pending_tokens.push((
-                            left,
-                            tokens[index].clone(),
-                            word.clone(),
-                            word_ocurrences,
-                            position,
+                    if !final_tokens.is_empty() && prev_new_token {
+                        let left = final_tokens[final_tokens.len() - 1];
+                        let left_size = self.token_size(left);
+                        pending.push((
+                            (left, tokens[index]),
+                            word_id,
+                            word_freq,
+                            byte_count - left_size,
                         ));
                     }
-                    final_tokens.push(tokens[index].clone());
+                    final_tokens.push(tokens[index]);
                     prev_new_token = false;
                 }
-                byte_count += tokens[index].size();
+                byte_count += self.token_size(tokens[index]);
                 index += 1;
             }
-            self.word_tokens.insert(word.clone(), final_tokens);
+            self.word_tokens[word_id as usize] = final_tokens;
+
+            for (new_pair, word, freq, byte_offset) in pending {
+                Self::insert_new_pair(
+                    new_pair,
+                    &mut new_pairs,
+                    &mut self.tokens,
+                    word,
+                    freq,
+                    byte_offset,
+                );
+            }
         }
-        // Insert all pending tokens.
-        for (left, right, word, word_ocurrences, position) in pending_tokens {
-            Self::insert_new_token(
-                &left,
-                &right,
-                &mut new_tokens,
-                &mut self.tokens,
-                &word,
-                word_ocurrences,
-                position,
-            );
-        }
-        // Adding tokens that were created as part of the winning token merge to the max heap.
-        for token_info in new_tokens {
-            let token_ocurrences = self
-                .tokens
-                .get(&token_info)
-                .ok_or_else(|| TokenizationError::MissingToken(token_info.to_string()))?;
-            self.max_heap
-                .push((token_ocurrences.get_ocurrences_count(), Reverse(token_info)));
+        // Adding pairs that were created as part of the winning token merge to the max heap.
+        for new_pair in new_pairs {
+            self.push_pair_to_heap(new_pair)?;
         }
         Ok(())
     }
 
     /**
-     * It gets the token with the most ocurrences and return it.
+     * It gets the token pair with the most ocurrences, merges it, and returns the new token.
      * It also update the structures as follows:
-     *  - Update all tokens that overlap with the winning token.
-     *  - Create new tokens from the ones that are adyancent to the winning token after merge it.
+     *  - Update all tokens that overlap with the winning pair.
+     *  - Create new candidates from the ones that are adyancent to the winning token after merge it.
      *  - Register the winning token in the id maps and the merge table.
      */
     pub fn next_token(&mut self) -> Result<Option<(u32, TokenInfo)>, TokenizationError> {
-        let Some(winning_token) = self.get_winning_token()? else {
+        let Some(winning_info) = self.get_winning_token()? else {
             return Ok(None);
         };
 
-        // new token id for the winning token.
+        let Some(pair) = self.pair_of(&winning_info) else {
+            return Err(TokenizationError::MissingToken(winning_info.to_string()));
+        };
+
+        // new token id and bytes for the winning pair.
         let token_id = self.id_tokens.len() as u32;
-        // getting the left and right ids that compounds the new token.
-        let (left_id, right_id) = self.token_parts(&winning_token)?;
+        let mut token_bytes = self.id_tokens[&pair.0].clone();
+        token_bytes.extend_from_slice(&self.id_tokens[&pair.1]);
 
         // Adding the new token to the token id maps and the learned merge table.
-        self.tokens_id.insert(winning_token.to_bytes(), token_id);
-        self.id_tokens.insert(token_id, winning_token.to_bytes());
-        self.pair_merges.insert((left_id, right_id), token_id);
+        self.tokens_id.insert(token_bytes.clone(), token_id);
+        self.id_tokens.insert(token_id, token_bytes.clone());
+        self.token_sizes.push(token_bytes.len() as u32);
+        self.pair_merges.insert(pair, token_id);
 
-        // Update the overlapping tokens, removing the ocurrences that overlaps with the winning token.
-        let to_update = self.get_tokens_to_update(&winning_token)?;
+        // Update the overlapping candidates, removing the ocurrences that overlaps with the winning pair.
+        let to_update = self.get_tokens_to_update(pair)?;
         self.update_tokens(&to_update)?;
 
-        self.merge_winning_token_and_generate_new_ones(&winning_token)?;
+        self.merge_winning_token_and_generate_new_ones(pair)?;
 
-        Ok(Some((token_id, winning_token)))
+        Ok(Some((token_id, winning_info)))
     }
 }

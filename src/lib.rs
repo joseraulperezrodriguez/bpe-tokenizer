@@ -3,7 +3,7 @@ mod occurrences;
 mod token;
 
 pub use error::TokenizationError;
-pub use occurrences::{TokenOcurrences, OcurrencePosition};
+pub use occurrences::TokenOcurrences;
 pub use token::TokenInfo;
 
 pub mod pre_tokenization;
