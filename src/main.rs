@@ -7,28 +7,123 @@ use std::process::ExitCode;
 
 use bpe_tokenizer::{BPETokenizer, PreTokenization};
 
-// Usage: bpe-tokenizer <corpus-file-or-dir> <model-out> <vocab-size> [--skip-tags]
+// Usage:
+//   Train:   bpe-tokenizer <corpus-file-or-dir> <model-out> <vocab-size> [--skip-tags]
+//   Encode:  bpe-tokenizer --model <model-file> --encode <text>
+//   Decode:  bpe-tokenizer --model <model-file> --decode <id> [<id> ...]
 //
-// <corpus-file-or-dir> is a single text file, or a directory that is walked
-// recursively (wikiextractor layout: text/AA/wiki_00, text/AA/wiki_01, ...).
+// Training: <corpus-file-or-dir> is a single text file, or a directory that is
+// walked recursively (wikiextractor layout: text/AA/wiki_00, ...).
 // --skip-tags drops lines that start with '<' after trimming, which removes
 // the wikiextractor <doc ...> and </doc> markers from the word counts.
 //
-// Note: the whole word-count map and training state live in memory; this
-// driver is functional but will not scale to the full corpus until the
-// planned interning/memory redesign lands.
+// Inference: encodes @text into token ids (printed space-separated), or
+// decodes token ids back into text.
 
-const USAGE: &str =
-    "Usage: bpe-tokenizer <corpus-file-or-dir> <model-out> <vocab-size> [--skip-tags]";
+const USAGE: &str = "Usage:
+  Train:   bpe-tokenizer <corpus-file-or-dir> <model-out> <vocab-size> [--skip-tags]
+  Encode:  bpe-tokenizer --model <model-file> --encode <text>
+  Decode:  bpe-tokenizer --model <model-file> --decode <id> [<id> ...]";
 
 fn main() -> ExitCode {
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    // Any invocation containing --model switches to inference mode.
+    if let Some(position) = args.iter().position(|arg| arg == "--model") {
+        return inference_main(&args, position);
+    }
+    training_main(&args)
+}
+
+fn inference_main(args: &[String], model_position: usize) -> ExitCode {
+    let Some(model_path) = args.get(model_position + 1) else {
+        eprintln!("--model requires a file path.\n{}", USAGE);
+        return ExitCode::from(2);
+    };
+    let rest = &args[model_position + 2..];
+    let result: Result<(String, String), String> =
+        if rest.first().map(String::as_str) == Some("--encode") {
+            // Everything after --encode is the text to tokenize.
+            let text = rest[1..].join(" ");
+            encode_with_model(Path::new(model_path), &text).map(|(ids, stats)| {
+                let ids_line = ids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (ids_line, stats)
+            })
+        } else if rest.first().map(String::as_str) == Some("--decode") {
+            let ids: Result<Vec<u32>, String> = rest[1..]
+                .iter()
+                .map(|arg| {
+                    arg.parse::<u32>()
+                        .map_err(|_| format!("Not a valid token id: {}", arg))
+                })
+                .collect();
+            match ids {
+                Ok(ids) => decode_with_model(Path::new(model_path), &ids)
+                    .map(|text| (text, String::new())),
+                Err(message) => Err(message),
+            }
+        } else {
+            Err(format!("Missing --encode or --decode mode.\n{}", USAGE))
+        };
+    match result {
+        Ok((output, stats)) => {
+            println!("{}", output);
+            if !stats.is_empty() {
+                eprintln!("{}", stats);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("error: {}", message);
+            ExitCode::from(1)
+        }
+    }
+}
+
+/**
+ * Encodes @text with the model at @model_path, returning the token ids and a
+ * human-readable stats line.
+ */
+fn encode_with_model(model_path: &Path, text: &str) -> Result<(Vec<u32>, String), String> {
+    let tokenizer = BPETokenizer::load(model_path)
+        .map_err(|e| format!("Failed to load model: {}", e))?;
+    let ids = tokenizer.encode(text);
+    let stats = format!(
+        "{} tokens for {} bytes ({:.1} bytes/token)",
+        ids.len(),
+        text.len(),
+        if ids.is_empty() {
+            0.0
+        } else {
+            text.len() as f64 / ids.len() as f64
+        }
+    );
+    Ok((ids, stats))
+}
+
+/**
+ * Decodes @ids with the model at @model_path, returning the (lossy) text.
+ */
+fn decode_with_model(model_path: &Path, ids: &[u32]) -> Result<String, String> {
+    let tokenizer = BPETokenizer::load(model_path)
+        .map_err(|e| format!("Failed to load model: {}", e))?;
+    tokenizer
+        .decode_to_string(ids)
+        .map_err(|e| format!("Failed to decode: {}", e))
+}
+
+fn training_main(args: &[String]) -> ExitCode {
     // Accept the flag in any position; everything else must be the 3 required arguments.
     let mut positional: Vec<String> = Vec::new();
     let mut skip_tags = false;
-    for arg in env::args().skip(1) {
+    for arg in args {
         match arg.as_str() {
             "--skip-tags" => skip_tags = true,
-            _ => positional.push(arg),
+            _ => positional.push(arg.clone()),
         }
     }
     if positional.len() != 3 {
@@ -307,5 +402,55 @@ mod tests {
         // collected exactly once.
         assert_eq!(files, vec![fs::canonicalize(&corpus_file).unwrap()]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /** Trains a small model and writes it to a temporary file. */
+    fn temporary_model() -> (PathBuf, HashMap<String, u64>) {
+        let mut words = HashMap::new();
+        PreTokenization::count_tokens("the quick brown fox", &mut words);
+        PreTokenization::count_tokens("the lazy dog", &mut words);
+        let mut tokenizer = BPETokenizer::new(words);
+        tokenizer.initialize().unwrap();
+        tokenizer.train(280).unwrap();
+
+        let model_path = temporary_directory().with_extension("bin");
+        tokenizer.save(&model_path).unwrap();
+        (model_path, HashMap::new())
+    }
+
+    #[test]
+    fn encode_with_model_returns_token_ids_and_stats() {
+        let (model_path, _) = temporary_model();
+
+        let (ids, stats) = encode_with_model(&model_path, "the quick brown fox").unwrap();
+
+        assert!(!ids.is_empty());
+        assert!(stats.contains("bytes/token"));
+        // Round trip through the decoder restores the text.
+        let text = decode_with_model(&model_path, &ids).unwrap();
+        assert_eq!(text, "the quick brown fox");
+        fs::remove_file(&model_path).unwrap();
+    }
+
+    #[test]
+    fn decode_with_model_rejects_unknown_ids() {
+        let (model_path, _) = temporary_model();
+
+        assert!(decode_with_model(&model_path, &[999_999]).is_err());
+        fs::remove_file(&model_path).unwrap();
+    }
+
+    #[test]
+    fn encode_with_model_rejects_a_missing_model_file() {
+        assert!(encode_with_model(Path::new("missing-model.bin"), "text").is_err());
+    }
+
+    #[test]
+    fn encode_with_model_handles_empty_text() {
+        let (model_path, _) = temporary_model();
+
+        let (ids, _) = encode_with_model(&model_path, "").unwrap();
+        assert!(ids.is_empty());
+        fs::remove_file(&model_path).unwrap();
     }
 }

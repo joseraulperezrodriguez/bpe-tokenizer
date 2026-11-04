@@ -66,4 +66,17 @@ Encoding/decoding: each learned merge is stored in a `(left ID, right ID) -> mer
 
 Serialization (`to_bytes`/`from_bytes`, `save`/`load`): the model file stores only the learned merge list, in merged-ID order, in a compact little-endian binary format (`BPET` magic, version, merge count, then `left_id, right_id` per merge). Token bytes, the ID maps, and the base byte vocabulary are all rebuilt deterministically from that list on load, so a 100K-merge model is roughly 800 KB on disk. A loaded tokenizer is ready for encode/decode with no training state.
 
-Training driver: `train(target_vocab_size)` runs merges until the vocabulary reaches the target (256 base tokens + learned merges) or the corpus is exhausted; `vocab_size()` reports the current size and is what an LLM's embedding table must be sized to. The `bpe-tokenizer` binary accepts a single corpus file or a directory (walked recursively, in sorted order, e.g. a wikiextractor `text/` tree): `bpe-tokenizer <corpus-file-or-dir> <model-out> <vocab-size> [--skip-tags]`. With `--skip-tags`, lines starting with `<` are dropped from the word counts, removing the wikiextractor `<doc>`/`</doc>` markers.
+Training driver: `train(target_vocab_size)` runs merges until the vocabulary reaches the target (256 base tokens + learned merges) or the corpus is exhausted; `vocab_size()` reports the current size and is what an LLM's embedding table must be sized to. The `bpe-tokenizer` binary covers the full lifecycle:
+
+```
+# Train: corpus file or directory (walked recursively, in sorted order, e.g. a wikiextractor `text/` tree).
+bpe-tokenizer <corpus-file-or-dir> <model-out> <vocab-size> [--skip-tags]
+
+# Encode text into token ids (printed space-separated, with bytes/token stats on stderr).
+bpe-tokenizer --model <model-file> --encode <text>
+
+# Decode token ids back into text.
+bpe-tokenizer --model <model-file> --decode <id> [<id> ...]
+```
+
+With `--skip-tags`, lines starting with `<` are dropped from the word counts, removing the wikiextractor `<doc>`/`</doc>` markers. Corpus directories are walked with cycle protection: paths are canonicalized and remembered, so links (including directory cycles) are followed at most once and the same content is never counted twice.
