@@ -80,3 +80,5 @@ bpe-tokenizer --model <model-file> --decode <id> [<id> ...]
 ```
 
 With `--skip-tags`, lines starting with `<` are dropped from the word counts, removing the wikiextractor `<doc>`/`</doc>` markers. Corpus directories are walked with cycle protection: paths are canonicalized and remembered, so links (including directory cycles) are followed at most once and the same content is never counted twice.
+
+Trained models live in [`models/`](models/) — see [models/README.md](models/README.md) for the available vocabulary and how to reproduce it.
