@@ -77,8 +77,14 @@ bpe-tokenizer --model <model-file> --encode <text>
 
 # Decode token ids back into text.
 bpe-tokenizer --model <model-file> --decode <id> [<id> ...]
+
+# Export a corpus as flat token streams for training (see docs/data-bridge-spec.md).
+# Writes <out-dir>/train.bin and <out-dir>/val.bin; --force overwrites existing outputs.
+bpe-tokenizer --model <model-file> --export <corpus-dir> <out-dir> [--val-ratio <pct>] [--skip-tags] [--force]
 ```
 
 With `--skip-tags`, lines starting with `<` are dropped from the word counts, removing the wikiextractor `<doc>`/`</doc>` markers. Corpus directories are walked with cycle protection: paths are canonicalized and remembered, so links (including directory cycles) are followed at most once and the same content is never counted twice.
+
+The export mode streams the corpus line by line (sharing one per-word cache across the whole corpus via `encode_with_cache`), routes whole files to train or val with a Bresenham-style spread at exactly `--val-ratio` percent, skips the wikiextractor markers with `--skip-tags`, encodes invalid UTF-8 lines lossily instead of aborting the run, and refuses to overwrite previous outputs unless `--force` is given (a rerun also never encodes its own output directory). The little-endian uint32 format — an 8-byte header (`n_tokens`, `vocab_hint`) followed by the token ids — is rewritten by seek-back once the count is known, so the corpus is never held in memory (a full-corpus export is too large to buffer). Whole-file routing keeps near-duplicate articles from straddling the train/val boundary. These files feed the [gpt-model](../gpt-model) training loop directly (`gpt_model/data.py`).
 
 Trained models live in [`models/`](models/) — see [models/README.md](models/README.md) for the available vocabulary and how to reproduce it.

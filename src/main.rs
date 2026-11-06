@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -11,6 +11,7 @@ use bpe_tokenizer::{BPETokenizer, PreTokenization};
 //   Train:   bpe-tokenizer <corpus-file-or-dir> <model-out> <vocab-size> [--skip-tags]
 //   Encode:  bpe-tokenizer --model <model-file> --encode <text>
 //   Decode:  bpe-tokenizer --model <model-file> --decode <id> [<id> ...]
+//   Export:  bpe-tokenizer --model <model-file> --export <corpus-dir> <out-dir> [--val-ratio <pct>] [--skip-tags] [--force]
 //
 // Training: <corpus-file-or-dir> is a single text file, or a directory that is
 // walked recursively (wikiextractor layout: text/AA/wiki_00, ...).
@@ -19,11 +20,17 @@ use bpe_tokenizer::{BPETokenizer, PreTokenization};
 //
 // Inference: encodes @text into token ids (printed space-separated), or
 // decodes token ids back into text.
+//
+// Export: walks the corpus and writes two flat token-id files for training,
+// <out-dir>/train.bin and <out-dir>/val.bin (format: docs/data-bridge-spec.md).
+// Files are routed whole to train or val, spread evenly in sorted order.
+// The format is little-endian uint32: header [n_tokens, vocab_hint], then the ids.
 
 const USAGE: &str = "Usage:
   Train:   bpe-tokenizer <corpus-file-or-dir> <model-out> <vocab-size> [--skip-tags]
   Encode:  bpe-tokenizer --model <model-file> --encode <text>
-  Decode:  bpe-tokenizer --model <model-file> --decode <id> [<id> ...]";
+  Decode:  bpe-tokenizer --model <model-file> --decode <id> [<id> ...]
+  Export:  bpe-tokenizer --model <model-file> --export <corpus-dir> <out-dir> [--val-ratio <pct>] [--skip-tags] [--force]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -41,42 +48,34 @@ fn inference_main(args: &[String], model_position: usize) -> ExitCode {
         return ExitCode::from(2);
     };
     let rest = &args[model_position + 2..];
-    let result: Result<(String, String), String> =
-        if rest.first().map(String::as_str) == Some("--encode") {
-            // Everything after --encode is the text to tokenize.
-            let text = rest[1..].join(" ");
-            encode_with_model(Path::new(model_path), &text).map(|(ids, stats)| {
-                let ids_line = ids
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                (ids_line, stats)
-            })
-        } else if rest.first().map(String::as_str) == Some("--decode") {
-            let ids: Result<Vec<u32>, String> = rest[1..]
-                .iter()
-                .map(|arg| {
-                    arg.parse::<u32>()
-                        .map_err(|_| format!("Not a valid token id: {}", arg))
-                })
-                .collect();
-            match ids {
-                Ok(ids) => decode_with_model(Path::new(model_path), &ids)
-                    .map(|text| (text, String::new())),
-                Err(message) => Err(message),
-            }
-        } else {
-            Err(format!("Missing --encode or --decode mode.\n{}", USAGE))
-        };
-    match result {
-        Ok((output, stats)) => {
-            println!("{}", output);
+    let result: Result<(), String> = if rest.first().map(String::as_str) == Some("--export") {
+        export_main(Path::new(model_path), &rest[1..])
+    } else if rest.first().map(String::as_str) == Some("--encode") {
+        let text = rest[1..].join(" ");
+        encode_with_model(Path::new(model_path), &text).map(|(ids, stats)| {
+            println!(
+                "{}",
+                ids.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")
+            );
             if !stats.is_empty() {
                 eprintln!("{}", stats);
             }
-            ExitCode::SUCCESS
-        }
+        })
+    } else if rest.first().map(String::as_str) == Some("--decode") {
+        let ids: Result<Vec<u32>, String> = rest[1..]
+            .iter()
+            .map(|arg| {
+                arg.parse::<u32>()
+                    .map_err(|_| format!("Not a valid token id: {}", arg))
+            })
+            .collect();
+        ids.and_then(|ids| decode_with_model(Path::new(model_path), &ids))
+            .map(|text| println!("{}", text))
+    } else {
+        Err(format!("Missing --encode, --decode or --export mode.\n{}", USAGE))
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("error: {}", message);
             ExitCode::from(1)
@@ -114,6 +113,260 @@ fn decode_with_model(model_path: &Path, ids: &[u32]) -> Result<String, String> {
     tokenizer
         .decode_to_string(ids)
         .map_err(|e| format!("Failed to decode: {}", e))
+}
+
+//---------------------------------------------------------------------------
+
+/**
+ * Streaming writer for one token .bin file. The 8-byte header cannot be known
+ * before streaming, so a zero header is written up front and rewritten by
+ * seek-back in finalize().
+ */
+struct ExportWriter {
+    writer: BufWriter<File>,
+    path: PathBuf,
+    tokens: u64,
+    input_bytes: u64,
+}
+
+impl ExportWriter {
+    fn create(path: &Path) -> Result<Self, String> {
+        let file =
+            File::create(path).map_err(|e| format!("Failed to create {}: {}", path.display(), e))?;
+        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+        writer
+            .write_all(&[0u8; 8])
+            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+        Ok(Self {
+            writer,
+            path: path.to_path_buf(),
+            tokens: 0,
+            input_bytes: 0,
+        })
+    }
+
+    fn write_ids(&mut self, ids: &[u32], input_bytes: u64) -> Result<(), String> {
+        for id in ids {
+            self.writer
+                .write_all(&id.to_le_bytes())
+                .map_err(|e| format!("Failed to write {}: {}", self.path.display(), e))?;
+        }
+        self.tokens += ids.len() as u64;
+        self.input_bytes += input_bytes;
+        Ok(())
+    }
+
+    /** Finishes a token file: flush, seek back to the header, write the counts. */
+    fn finalize(self, vocab_hint: u32) -> Result<(u64, u64), String> {
+        if self.tokens > u32::MAX as u64 {
+            return Err(format!(
+                "{} holds more than u32::MAX tokens; the format cannot describe it.",
+                self.path.display()
+            ));
+        }
+        let mut file = self
+            .writer
+            .into_inner()
+            .map_err(|e| format!("Failed to flush {}: {}", self.path.display(), e))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("Failed to seek {}: {}", self.path.display(), e))?;
+        // The header stores u32 values: tokens fit (guarded above), and the
+        // u64→u32 cast is what keeps the header exactly 8 bytes wide.
+        let n_tokens = u32::try_from(self.tokens).expect("guarded above");
+        file.write_all(&n_tokens.to_le_bytes())
+            .and_then(|_| file.write_all(&vocab_hint.to_le_bytes()))
+            .and_then(|_| file.sync_all())
+            .map_err(|e| format!("Failed to finalize {}: {}", self.path.display(), e))?;
+        Ok((self.tokens, self.input_bytes))
+    }
+}
+
+/**
+ * Parses --export arguments: <corpus-dir> <out-dir> [--val-ratio <pct>]
+ * [--skip-tags] [--force].
+ *
+ * File i routes to val when floor((i+1) * val_ratio / 100) differs from
+ * floor(i * val_ratio / 100) — a Bresenham-style distribution that spreads
+ * val evenly through the sorted corpus order at exactly the requested
+ * ratio, for any corpus size (10% of 19,404 files is ~1,940 files; 25% of a
+ * 4-file test corpus is exactly 1 file, at a different index each).
+ */
+fn export_main(
+    model_path: &Path,
+    args: &[String],
+) -> Result<(), String> {
+    let mut positional: Vec<String> = Vec::new();
+    let mut val_ratio_percent: usize = 10;
+    let mut skip_tags = false;
+    let mut force = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--val-ratio" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--val-ratio requires a value (0-100).".to_string())?;
+                val_ratio_percent = value
+                    .parse()
+                    .map_err(|_| format!("Not a valid --val-ratio: {}", value))?;
+                if val_ratio_percent > 100 {
+                    return Err("--val-ratio must be between 0 and 100.".to_string());
+                }
+            }
+            "--skip-tags" => skip_tags = true,
+            "--force" => force = true,
+            other => positional.push(other.to_string()),
+        }
+        index += 1;
+    }
+    if positional.len() != 2 {
+        return Err(format!(
+            "--export requires <corpus-dir> and <out-dir>.\n{}",
+            USAGE
+        ));
+    }
+    let corpus_path = PathBuf::from(&positional[0]);
+    let out_dir = PathBuf::from(&positional[1]);
+    fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("Failed to create {}: {}", out_dir.display(), e))?;
+    let train_path = out_dir.join("train.bin");
+    let val_path = out_dir.join("val.bin");
+    for output in [train_path.as_path(), val_path.as_path()] {
+        if output.exists() && !force {
+            return Err(format!(
+                "{} already exists; pass --force to overwrite.",
+                output.display()
+            ));
+        }
+    }
+    export_corpus(
+        model_path,
+        &corpus_path,
+        &out_dir,
+        val_ratio_percent,
+        skip_tags,
+    )
+}
+
+/**
+ * Walks @corpus_path and streams every line's token ids into train.bin /
+ * val.bin under @out_dir, then finishes both headers and reports.
+ */
+fn export_corpus(
+    model_path: &Path,
+    corpus_path: &Path,
+    out_dir: &Path,
+    val_ratio_percent: usize,
+    skip_tags: bool,
+) -> Result<(), String> {
+    let tokenizer = BPETokenizer::load(model_path)
+        .map_err(|e| format!("Failed to load model: {}", e))?;
+    let vocab_hint = tokenizer.vocab_size() as u32;
+
+    // Files are routed whole (not token-by-token) so near-duplicate text
+    // cannot straddle the train/val boundary.
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let model_output = resolve_output_path(model_path)?;
+    collect_files(corpus_path, &model_output, &mut files, &mut visited)?;
+    // A rerun with --force must not encode the previous run's own output.
+    let canonical_out_dir = fs::canonicalize(out_dir).map_err(|e| {
+        format!("Failed to resolve {}: {}", out_dir.display(), e)
+    })?;
+    files.retain(|file| !file.starts_with(&canonical_out_dir));
+    let total_files = files.len();
+    if total_files == 0 {
+        return Err("Corpus path contains no files.".to_string());
+    }
+
+    let mut train_writer = ExportWriter::create(&out_dir.join("train.bin"))?;
+    let mut val_writer = ExportWriter::create(&out_dir.join("val.bin"))?;
+    // One cache shared across the entire corpus: repeated words are encoded once.
+    let mut word_cache: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut lossy_lines: u64 = 0;
+    let mut train_files: usize = 0;
+    let mut val_files: usize = 0;
+
+    for (index, file) in files.iter().enumerate() {
+        let writer = if ((index + 1) * val_ratio_percent) / 100 > (index * val_ratio_percent) / 100 {
+            val_files += 1;
+            &mut val_writer
+        } else {
+            train_files += 1;
+            &mut train_writer
+        };
+        let corpus_file =
+            File::open(file).map_err(|e| format!("Failed to open {}: {}", file.display(), e))?;
+        let mut reader = BufReader::new(corpus_file);
+        let mut buffer: Vec<u8> = Vec::new();
+        loop {
+            buffer.clear();
+            let read = reader
+                .read_until(b'\n', &mut buffer)
+                .map_err(|e| format!("Failed reading {}: {}", file.display(), e))?;
+            if read == 0 {
+                break;
+            }
+            // Strip the trailing newline (and a \r before it), then re-add the
+            // '\n' inside the encoded text: line endings normalize for free and
+            // article boundaries survive round-trips.
+            let mut line_bytes: &[u8] = &buffer;
+            if line_bytes.last() == Some(&b'\n') {
+                line_bytes = &line_bytes[..line_bytes.len() - 1];
+            }
+            if line_bytes.last() == Some(&b'\r') {
+                line_bytes = &line_bytes[..line_bytes.len() - 1];
+            }
+            let line = match std::str::from_utf8(line_bytes) {
+                Ok(line) => line.to_string(),
+                Err(_) => {
+                    // Invalid UTF-8 does not abort a multi-hour export.
+                    lossy_lines += 1;
+                    String::from_utf8_lossy(line_bytes).into_owned()
+                }
+            };
+            if skip_tags && line.trim_start().starts_with('<') {
+                continue;
+            }
+            let mut input = String::with_capacity(line.len() + 1);
+            input.push_str(&line);
+            input.push('\n');
+            let input_bytes = input.len() as u64;
+            let ids = tokenizer.encode_with_cache(&input, &mut word_cache);
+            writer.write_ids(&ids, input_bytes)?;
+        }
+        if (index + 1) % 500 == 0 || index + 1 == total_files {
+            eprintln!(
+                "  {}/{} files | train: {} tokens | val: {} tokens",
+                index + 1,
+                total_files,
+                train_writer.tokens,
+                val_writer.tokens
+            );
+        }
+    }
+
+    let (train_tokens, train_bytes) = train_writer.finalize(vocab_hint)?;
+    let (val_tokens, val_bytes) = val_writer.finalize(vocab_hint)?;
+
+    let report = |name: &str, tokens: u64, bytes: u64, file_count: usize| {
+        let bytes_per_token = if tokens > 0 {
+            bytes as f64 / tokens as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "{}: {} tokens from {} files ({:.1} bytes/token)",
+            name, tokens, file_count, bytes_per_token
+        );
+    };
+    report("train.bin", train_tokens, train_bytes, train_files);
+    report("val.bin", val_tokens, val_bytes, val_files);
+    if lossy_lines > 0 {
+        eprintln!("warning: {} lines contained invalid UTF-8 (encoded lossily)", lossy_lines);
+    }
+    Ok(())
 }
 
 fn training_main(args: &[String]) -> ExitCode {
@@ -451,6 +704,218 @@ mod tests {
 
         let (ids, _) = encode_with_model(&model_path, "").unwrap();
         assert!(ids.is_empty());
+        fs::remove_file(&model_path).unwrap();
+    }
+
+    //-----------------------------------------------------------------------
+    // --export tests
+
+    /** Reads a token .bin file: (n_tokens header, vocab header, ids). */
+    fn read_export_file(path: &Path) -> (u32, u32, Vec<u32>) {
+        let bytes = fs::read(path).unwrap();
+        assert!(bytes.len() >= 8, "missing header");
+        let n_tokens = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let vocab_hint = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let ids: Vec<u32> = bytes[8..]
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(ids.len() as u32, n_tokens, "header count must match the body");
+        (n_tokens, vocab_hint, ids)
+    }
+
+    /** Creates a corpus with @files as (file_stem, content) pairs. */
+    fn export_test_corpus(root: &Path, files: &[(&str, &str)]) {
+        fs::create_dir_all(root).unwrap();
+        for (name, content) in files {
+            fs::write(root.join(name), content).unwrap();
+        }
+    }
+
+    /**
+     * Exports @corpus with a trained model and returns the decoded text of
+     * (train, val) plus the recorded vocab hint.
+     */
+    fn export_and_decode(
+        model_path: &Path,
+        corpus: &Path,
+        out_dir: &Path,
+        args: &[&str],
+    ) -> (String, String, u32) {
+        let mut all_args: Vec<String> = vec![
+            corpus.to_string_lossy().into_owned(),
+            out_dir.to_string_lossy().into_owned(),
+        ];
+        for arg in args {
+            all_args.push((*arg).to_string());
+        }
+        export_main(model_path, &all_args).unwrap();
+
+        let tokenizer = BPETokenizer::load(model_path).unwrap();
+        let (train_n, train_vocab, train_ids) = read_export_file(&out_dir.join("train.bin"));
+        let (val_n, val_vocab, val_ids) = read_export_file(&out_dir.join("val.bin"));
+        assert_eq!(train_vocab, val_vocab);
+        let train = tokenizer.decode_to_string(&train_ids).unwrap();
+        let val = tokenizer.decode_to_string(&val_ids).unwrap();
+        assert_eq!(train_ids.len() as u32, train_n);
+        assert_eq!(val_ids.len() as u32, val_n);
+        (train, val, val_vocab)
+    }
+
+    #[test]
+    fn export_writes_valid_headers_and_routes_whole_files() {
+        let (model_path, _) = temporary_model();
+        let root = temporary_directory();
+        let corpus = root.join("corpus");
+        export_test_corpus(
+            &corpus,
+            &[
+                ("f0", "trainmarker alpha\n"),
+                ("f1", "trainmarker beta\n"),
+                ("f2", "trainmarker gamma\n"),
+                ("f3", "valmarker zero\nvalmarker one\n"),
+            ],
+        );
+        let out_dir = root.join("data");
+
+        // 25% of 4 files is exactly 1 file; the Bresenham routing picks index 3.
+        let (train, val, vocab_hint) = export_and_decode(
+            &model_path,
+            &corpus,
+            &out_dir,
+            &["--val-ratio", "25"],
+        );
+        let expected_vocab = BPETokenizer::load(&model_path).unwrap().vocab_size() as u32;
+        assert_eq!(vocab_hint, expected_vocab);
+
+        // Whole files are routed: val is exactly f3, train exactly the rest.
+        assert_eq!(val, "valmarker zero\nvalmarker one\n");
+        assert_eq!(
+            train,
+            "trainmarker alpha\ntrainmarker beta\ntrainmarker gamma\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(&model_path).unwrap();
+    }
+
+    #[test]
+    fn export_is_deterministic() {
+        let (model_path, _) = temporary_model();
+        let root = temporary_directory();
+        let corpus = root.join("corpus");
+        export_test_corpus(
+            &corpus,
+            &[("a", "alpha\n"), ("b", "beta\n"), ("c", "gamma\n")],
+        );
+
+        let out_a = root.join("data-a");
+        let out_b = root.join("data-b");
+        for out in [&out_a, &out_b] {
+            let args = vec![
+                corpus.to_string_lossy().into_owned(),
+                out.to_string_lossy().into_owned(),
+            ];
+            export_main(&model_path, &args).unwrap();
+        }
+
+        assert_eq!(
+            fs::read(out_a.join("train.bin")).unwrap(),
+            fs::read(out_b.join("train.bin")).unwrap()
+        );
+        assert_eq!(
+            fs::read(out_a.join("val.bin")).unwrap(),
+            fs::read(out_b.join("val.bin")).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(&model_path).unwrap();
+    }
+
+    #[test]
+    fn export_rejects_existing_outputs_without_force() {
+        let (model_path, _) = temporary_model();
+        let root = temporary_directory();
+        let corpus = root.join("corpus");
+        export_test_corpus(&corpus, &[("a", "alpha\n")]);
+        let out_dir = root.join("data");
+        fs::create_dir_all(&out_dir).unwrap();
+        fs::write(out_dir.join("train.bin"), "previous").unwrap();
+
+        let args = vec![
+            corpus.to_string_lossy().into_owned(),
+            out_dir.to_string_lossy().into_owned(),
+        ];
+        let err = export_main(&model_path, &args).unwrap_err();
+        assert!(err.contains("--force"));
+
+        // With --force the previous output is replaced, not appended to.
+        let mut forced = args;
+        forced.push("--force".to_string());
+        export_main(&model_path, &forced).unwrap();
+        let (n_tokens, _, ids) = read_export_file(&out_dir.join("train.bin"));
+        assert_eq!(n_tokens as usize, ids.len());
+        assert!(fs::read(&out_dir.join("train.bin")).unwrap().len() > 8);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(&model_path).unwrap();
+    }
+
+    #[test]
+    fn export_skips_tag_lines_and_normalizes_line_endings() {
+        let (model_path, _) = temporary_model();
+        let root = temporary_directory();
+        let corpus = root.join("corpus");
+        // CRLF endings and wikiextractor-style markers; only content remains.
+        export_test_corpus(
+            &corpus,
+            &[("a", "<doc id=\"1\">\r\nreal content here\r\n</doc>\r\n")],
+        );
+        let out_dir = root.join("data");
+
+        let (train, _, _) = export_and_decode(&model_path, &corpus, &out_dir, &["--skip-tags"]);
+        assert_eq!(train, "real content here\n");
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(&model_path).unwrap();
+    }
+
+    #[test]
+    fn export_never_encodes_its_own_output_directory() {
+        let (model_path, _) = temporary_model();
+        let root = temporary_directory();
+        let corpus = root.join("corpus");
+        export_test_corpus(&corpus, &[("a", "alpha\n")]);
+        let out_dir = corpus.join("data"); // nested inside the corpus
+        fs::create_dir_all(&out_dir).unwrap();
+        fs::write(out_dir.join("stale.bin"), "stale output from a previous run\n").unwrap();
+
+        let (train, _, _) = export_and_decode(&model_path, &corpus, &out_dir, &[]);
+        assert_eq!(train, "alpha\n");
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(&model_path).unwrap();
+    }
+
+    #[test]
+    fn export_rejects_an_empty_corpus_and_bad_arguments() {
+        let (model_path, _) = temporary_model();
+        let root = temporary_directory();
+        let corpus = root.join("corpus");
+        fs::create_dir_all(&corpus).unwrap();
+        let out_dir = root.join("data");
+
+        let err = export_main(
+            &model_path,
+            &[
+                corpus.to_string_lossy().into_owned(),
+                out_dir.to_string_lossy().into_owned(),
+                "--val-ratio".to_string(),
+                "101".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("--val-ratio"));
+
+        let err = export_main(&model_path, &[]).unwrap_err();
+        assert!(err.contains("--export requires"));
+
+        fs::remove_dir_all(root).unwrap();
         fs::remove_file(&model_path).unwrap();
     }
 }

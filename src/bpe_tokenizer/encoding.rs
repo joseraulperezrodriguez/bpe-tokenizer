@@ -11,15 +11,35 @@ impl BPETokenizer {
      * applying the learned merges in the order they were learned.
      */
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        // A per-call cache keeps the existing semantics: callers of encode()
+        // get no reuse across calls.
+        let mut word_cache: HashMap<String, Vec<u32>> = HashMap::new();
+        self.encode_with_cache(text, &mut word_cache)
+    }
+
+    /**
+     * Encodes a piece of text into token ids, reusing a persistent per-word cache.
+     *
+     * The cache maps each pre-token to its encoded ids, so a word repeated across
+     * calls (the norm in a bulk corpus export) is encoded once. Sharing one cache
+     * over a whole corpus is safe: encoding is a pure function of the merge table,
+     * which is immutable after loading.
+     *
+     * Keys are owned because the pre-token slices only live as long as @text.
+     */
+    pub fn encode_with_cache(
+        &self,
+        text: &str,
+        cache: &mut HashMap<String, Vec<u32>>,
+    ) -> Vec<u32> {
         let words = PreTokenization::split(text);
-        // Words repeated in the text encode identically, so we cache per-word results.
-        let mut word_cache: HashMap<&str, Vec<u32>> = HashMap::new();
         let mut ids: Vec<u32> = Vec::new();
         for word in words {
-            let word_ids = word_cache
-                .entry(word)
-                .or_insert_with(|| self.encode_word(word.as_bytes()));
-            ids.extend_from_slice(word_ids);
+            if !cache.contains_key(word) {
+                let encoded = self.encode_word(word.as_bytes());
+                cache.insert(word.to_string(), encoded);
+            }
+            ids.extend_from_slice(&cache[word]);
         }
         ids
     }
@@ -105,6 +125,37 @@ mod tests {
             tokenizer.next_token().unwrap();
         }
         tokenizer
+    }
+
+    #[test]
+    fn encode_with_cache_agrees_with_encode() {
+        let tokenizer = trained_tokenizer("the quick brown fox", 10);
+
+        let text = "the quick brown cat jumps over the lazy dog";
+        let mut cache = HashMap::new();
+        let cached_ids = tokenizer.encode_with_cache(text, &mut cache);
+        assert_eq!(cached_ids, tokenizer.encode(text));
+    }
+
+    #[test]
+    fn encode_with_cache_hits_the_cache_for_repeated_words() {
+        let tokenizer = trained_tokenizer("hello world", 5);
+
+        let mut cache = HashMap::new();
+        tokenizer.encode_with_cache("hello world", &mut cache);
+        let cache_size = cache.len();
+        assert!(cache_size > 0);
+
+        // The second call must reuse the entries: no new cache words, and the
+        // same ids come back out.
+        let ids = tokenizer.encode_with_cache("hello world", &mut cache);
+        assert_eq!(cache.len(), cache_size);
+        assert_eq!(tokenizer.decode_to_string(&ids).unwrap(), "hello world");
+
+        // A new word extends the cache by exactly its pre-tokens.
+        let words_before = cache.len();
+        tokenizer.encode_with_cache("hello there world", &mut cache);
+        assert!(cache.len() > words_before);
     }
 
     #[test]
